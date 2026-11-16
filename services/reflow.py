@@ -433,11 +433,27 @@ def _recorte(pagina):
     extrator ("on_delete=models.CAS"). No PDF, a pagina e o limite -- o que
     fica fora dela e lixo de diagramacao, nao conteudo."""
     try:
-        if pagina.parent.is_reflowable:
+        from services.pdf_service import veio_de_epub
+        if veio_de_epub(pagina.parent):
             return fitz.INFINITE_RECT()
     except Exception:
         pass
     return None
+
+
+def _consertar(dados, pagina):
+    """Aplica a tabela de ligaduras do EPUB paginado (ver pdf_service)."""
+    try:
+        from services.pdf_service import tabela_de_texto
+        tabela = tabela_de_texto(pagina.parent)
+    except Exception:
+        tabela = None
+    if tabela:
+        for bloco in dados.get("blocks", []):
+            for linha in bloco.get("lines", []):
+                for span in linha.get("spans", []):
+                    span["text"] = span["text"].translate(tabela)
+    return dados
 
 
 def _limpar(texto: str) -> str:
@@ -456,6 +472,10 @@ _MARCADORES_PRIVADOS = str.maketrans({
     "\uf0b7": "\u2022", "\uf0a7": "\u25aa", "\uf076": "\u2022", "\uf0d8": "\u2022",
     "\uf0a8": "\u2022", "\uf06e": "\u25aa", "\uf0fc": "\u2713", "\uf0e0": "\u2192",
     "\uf0ad": "\u2022", "\uf02d": "\u2013",
+    # O MuPDF grava TODO hifen como inseparavel (U+2011) ao converter EPUB
+    # para PDF; de volta ao hifen comum, a busca acha "Self-Play" e a quebra
+    # de silaba no fim da linha e desfeita pela regra de sempre.
+    "\u2011": "-",
 })
 
 
@@ -755,7 +775,7 @@ class MotorReflow:
                 # Sem os BYTES das imagens: aqui so interessam geometria e
                 # texto, e decodificar cada figura de 24 paginas era o passo
                 # mais caro da abertura do livro.
-                dados = pagina.get_text("dict", flags=_FLAGS_SEM_IMAGEM, clip=_recorte(pagina))
+                dados = _consertar(pagina.get_text("dict", flags=_FLAGS_SEM_IMAGEM, clip=_recorte(pagina)), pagina)
             except Exception:
                 continue
 
@@ -838,7 +858,8 @@ class MotorReflow:
             # EPUB nao tem cabecalho nem rodape: quem pagina e o MuPDF. O que
             # se "repete na margem" ali sao titulos de capitulo ("Capitulo 1",
             # "Capitulo 2" -> mesma assinatura) -- e eles sumiam do livro.
-            if getattr(self.doc, "is_reflowable", False):
+            from services.pdf_service import veio_de_epub
+            if veio_de_epub(self.doc):
                 self.recorrentes = set()
             # O limiar da imagem e mais alto que o do texto: cabecalho se repete
             # em toda pagina, mas uma ilustracao legitima pode reaparecer em
@@ -916,7 +937,7 @@ class MotorReflow:
             # Toda figura e rasterizada da propria pagina (veja `_rasterizar`),
             # entao os bytes embutidos nao servem para nada aqui -- e pedi-los
             # obrigaria a decodificar cada imagem duas vezes.
-            dados = pagina.get_text("dict", flags=_FLAGS_SEM_IMAGEM, clip=_recorte(pagina))
+            dados = _consertar(pagina.get_text("dict", flags=_FLAGS_SEM_IMAGEM, clip=_recorte(pagina)), pagina)
         except Exception as erro:
             resultado.blocos.append(Bloco("aviso", f"Nao foi possivel ler esta pagina.\n{erro}"))
             return resultado
@@ -1251,12 +1272,17 @@ class MotorReflow:
             # MuPDF o deixa no fim da linha quando parte a palavra ("Co\xad" +
             # "mo"). E invisivel -- antes so era apagado DEPOIS da juncao, e a
             # palavra virava "Co mo".
-            if texto.endswith("­"):
+            # U+2011 (hifen inseparavel) no FIM da linha e o mesmo caso: e como
+            # o MuPDF desenha essa quebra ao converter o EPUB para PDF -- um
+            # hifen que nao deixa quebrar nunca termina linha por vontade do autor.
+            if texto.endswith(("­", "‑")):
                 if ultima:
                     hifen_final = True
                 partes.append(texto[:-1])
                 continue
-            if re.search(r"[a-zà-ÿ]-$", texto):
+            # Qualquer letra antes do hifen -- inclusive ligaduras ("enﬁ-"
+            # + "ou"): so a-z deixava a palavra partida em dois.
+            if re.search(r"[^\W\d_]-$", texto):
                 if ultima:
                     hifen_final = True
                     partes.append(texto + " ")

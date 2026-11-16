@@ -25,7 +25,7 @@ from configuracoes import (APP_NOME, APP_VERSAO, CATEGORIAS, ESP, FONTE_UI,
                            adivinhar_categoria)
 from core.branding import carregar_logo
 from database.pastas import SOLTOS, TODOS
-from services.pdf_service import TIPOS_ARQUIVO, eh_livro
+from services.pdf_service import TIPOS_ARQUIVO, eh_livro, preparar_epub
 from ui.modais import Modais
 
 LARGURA_CARTAO = 178
@@ -1230,6 +1230,7 @@ class TelaEstante(ctk.CTkFrame):
         destino = self.pasta_atual if isinstance(self.pasta_atual, int) else None
 
         novos, repetidos, falhas, protegidos, ignorados = 0, 0, 0, 0, 0
+        epubs = 0
         for caminho in caminhos:
             if not eh_livro(caminho):
                 ignorados += 1
@@ -1252,6 +1253,11 @@ class TelaEstante(ctk.CTkFrame):
                                            meta["autor"], meta["total_paginas"],
                                            id_pasta=destino)
                 novos += 1
+                if caminho.lower().endswith(".epub"):
+                    # Pagina o EPUB agora, em outro processo: e o que faz ele
+                    # abrir na hora depois, sem travar a leitura.
+                    preparar_epub(caminho)
+                    epubs += 1
             except Exception as erro:
                 print(f"[Estante] Falha ao adicionar {caminho}: {erro}")
                 falhas += 1
@@ -1269,6 +1275,8 @@ class TelaEstante(ctk.CTkFrame):
             partes.append(f"{falhas} com erro")
         if ignorados:
             partes.append(f"{ignorados} ignorado(s): nao e PDF nem EPUB")
+        if epubs:
+            partes.append("EPUB sendo preparado em segundo plano (alguns segundos)")
         C.Toast.mostrar(self, "  ·  ".join(partes) or "Nada a fazer",
                         "ok" if novos else "info", 2600)
 

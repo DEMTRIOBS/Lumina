@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.3.1 — 2026-11-16
+
+### Travamentos corrigidos
+- **Folhas montadas com a janela sem altura:** logo apos abrir (ou maximizar)
+  o texto media poucos pixels e a grade de 5 paginas virava ~200 passos de
+  uma linha cada -- 6 a 12 s com a janela parada. Agora espera o layout.
+- **Cascata de remontagens:** o `update_idletasks` dentro da montagem rodava
+  callbacks pendentes (renderizar, montar de novo) por dentro. Removido;
+  montagem com trava contra reentrada. Virar a folha: ~0,1 s.
+- **IA local ligada na linha da janela:** o rotulo "Provedor" do assistente
+  sondava portas e podia LIGAR o motor da IA local ao abrir o livro. Agora o
+  rotulo nao liga nada; "Testar provedores" roda em segundo plano.
+
+### EPUB abre na hora
+- O EPUB e paginado UMA vez, ao importar (ou na primeira abertura dos ja
+  importados), num processo separado -- a janela nao para. Depois disso abre
+  em ~0,03 s em vez de 1-2 s, e indice, busca e analise deixam de travar a
+  leitura. Sumario preservado; ligaduras da fonte ("ft", "fi") consertadas
+  por livro, para a busca achar tudo.
+
 ## 2.3 — 2026-11-16
 
 ### Leitura

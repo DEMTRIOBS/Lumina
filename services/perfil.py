@@ -19,6 +19,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from services.pdf_service import texto_da_pagina
+
 
 # Quantas paginas amostrar. Varrer 1000 paginas inteiras em todo detector nao
 # se paga; a amostra distribuida representa bem a estrutura do livro.
@@ -56,7 +58,7 @@ def montar_contexto(documento, motor, cancelar=None) -> Optional[Contexto]:
         if contexto.abortou():
             return None
         try:
-            contexto.paginas[numero] = documento.load_page(numero).get_text("text")
+            contexto.paginas[numero] = texto_da_pagina(documento, numero)
         except Exception:
             continue
     return contexto

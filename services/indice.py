@@ -36,6 +36,7 @@ from dataclasses import dataclass, field, asdict
 
 from core.paths import user_path
 from ia.offline import _STOPWORDS, _normalizar
+from services.pdf_service import texto_da_pagina
 
 # ------------------------------------------------------------------ CONSTANTES
 # Faixa de tamanho de bloco. Abaixo do minimo o trecho nao tem contexto para
@@ -969,7 +970,7 @@ def construir(documento, id_livro, ao_progredir=None, cancelar=None,
         if cancelar is not None and cancelar.is_set():
             return indice
         try:
-            indice.indexar_pagina(numero, documento.load_page(numero).get_text("text"))
+            indice.indexar_pagina(numero, texto_da_pagina(documento, numero))
         except Exception:
             continue
         if ao_progredir and (feitas % 40 == 0 or feitas == len(ordem)):

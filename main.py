@@ -6,7 +6,21 @@ Por isso a janela sabe se encaixar sozinha, ficar sempre visivel e virar uma
 coluna estreita, tudo por teclado.
 """
 import sys
-import tkinter as tk
+
+# Processo auxiliar: paginar um EPUB e sair, sem janela (ver
+# services/pdf_service.py, preparar_epub). Fica antes de tudo para nao
+# carregar a interface a toa.
+if __name__ == "__main__" and len(sys.argv) >= 4 and sys.argv[1] == "--paginar-epub":
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except Exception:
+        pass
+    from services.pdf_service import converter_epub
+    converter_epub(sys.argv[2], sys.argv[3])
+    sys.exit(0)
+
+import tkinter as tk  # noqa: E402
 
 import customtkinter as ctk
 

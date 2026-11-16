@@ -678,11 +678,30 @@ class Modais:
 
         def testar():
             from ia.manager import AIManager
-            status.configure(text="Testando…", text_color=T.texto_suave)
+            status.configure(text="Testando… (a IA local pode levar alguns segundos "
+                                  "para ligar)", text_color=T.texto_suave)
             salvar()
-            pai.after(80, lambda: status.configure(
-                text=f"Ordem ativa: {AIManager(cfg).descrever_fila()}",
-                text_color=T.texto))
+            gerente = AIManager(cfg)
+
+            # Em segundo plano: descrever a fila completa sonda portas e pode
+            # ligar a IA local -- na linha da janela, ela congelava.
+            def trabalhador():
+                try:
+                    texto = f"Ordem ativa: {gerente.descrever_fila()}"
+                except Exception as erro:
+                    texto = f"Falha ao testar: {erro}"
+
+                def mostrar():
+                    try:
+                        if status.winfo_exists():
+                            status.configure(text=texto, text_color=T.texto)
+                    except Exception:
+                        pass
+                try:
+                    pai.after(0, mostrar)
+                except Exception:
+                    pass
+            threading.Thread(target=trabalhador, daemon=True).start()
 
         acoes = C.quadro(area, "transparent")
         acoes.pack(fill="x", pady=ESP["md"])

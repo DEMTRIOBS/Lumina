@@ -49,7 +49,8 @@ import services.tela as tela
 import services.dicionario as dicionario
 import services.vscode as vscode
 import services.voz as voz
-from services.pdf_service import abrir as abrir_livro
+from services.pdf_service import abrir as abrir_livro, preparar_epub
+from services.pdf_service import epub_pronto as pdf_cache_pronto
 from services.reflow import Bloco, MotorReflow
 from ui.modais import Modais
 
@@ -198,6 +199,7 @@ class TelaLeitor(ctk.CTkFrame):
         self._agendado_recentrar = None
         self._agendado_topo = None
         self._altura_da_grade = None
+        self._montando_folhas = False
         self._folga_folha = 0
         self._folha_atual = 0
         self._simulando = False
@@ -646,6 +648,17 @@ class TelaLeitor(ctk.CTkFrame):
         self.ativar_atalhos()
         self._atualizar_status_ia()
         self.renderizar()
+        # EPUB ainda sem paginacao guardada (importado antes desta versao):
+        # prepara agora, em outro processo. A partir da proxima abertura ele
+        # abre na hora e as tarefas de fundo deixam de travar a leitura.
+        if (livro["caminho_pdf"].lower().endswith(".epub")
+                and not pdf_cache_pronto(livro["caminho_pdf"])):
+            def pronto(ok):
+                if ok:
+                    self._na_ui(lambda: C.Toast.mostrar(
+                        self, "Livro preparado: da proxima vez ele abre na hora.",
+                        "ok", 2600))
+            preparar_epub(livro["caminho_pdf"], ao_terminar=pronto)
         # Volta ao paragrafo exato em que a leitura parou, nao so a pagina.
         rolagem = int(livro.get("rolagem") or 0)
         if rolagem > 0:
@@ -1954,7 +1967,6 @@ class TelaLeitor(ctk.CTkFrame):
         if self._em_folha():
             self._montar_folhas(ancora=offset)
             return
-        self.update_idletasks()
         self.txt.yview(f"1.0+{int(offset)}c")
         if recuo:
             self.txt.yview_scroll(int(recuo), "pixels")
@@ -1969,7 +1981,6 @@ class TelaLeitor(ctk.CTkFrame):
             return
         # `see` mede de verdade; yview_moveto(1.0) usa a ALTURA ESTIMADA e as
         # vezes parava a dois tercos da pagina.
-        self.update_idletasks()
         self.txt.see(ultimo)
 
     def _pode_estender(self, direcao):
@@ -2174,9 +2185,33 @@ class TelaLeitor(ctk.CTkFrame):
         redimensionar, trocar fonte): a grade se reorganiza em volta da frase
         do topo, em vez de a frase pular para o meio de outra folha.
         """
+        if self._montando_folhas:
+            # Reentrada: algum callback disparado no meio da montagem pediu
+            # outra. A de fora ja vai deixar a grade certa.
+            return
         self._grade_folhas = []
         if not self._em_folha():
             return
+        # Janela ainda sem altura de verdade (acabou de abrir/maximizar): com
+        # 1-20 px cada "folha" tinha UMA linha, e a grade de 5 paginas levava
+        # 200 passos (9 s parado). Espera o layout e monta uma vez so.
+        if self.txt.winfo_height() < 120:
+            if ancora is not None:
+                self.txt.yview(f"1.0+{int(ancora)}c")
+            self.after(120, lambda: self._montar_folhas(manter_indice, ancora))
+            return
+        self._montando_folhas = True
+        try:
+            self._montar_folhas_agora(manter_indice, ancora)
+        finally:
+            self._montando_folhas = False
+
+    def _montar_folhas_agora(self, manter_indice, ancora):
+        # Sem update_idletasks aqui nem na simulacao: o dlineinfo e os
+        # indices "@x,y" do Tk ja atualizam o layout sozinhos. O
+        # update_idletasks redesenhava a tela inteira a cada passo E rodava
+        # callbacks pendentes (renderizar, montar de novo...) por dentro --
+        # numa sessao real, uma montagem chegou a 12 s com a janela parada.
         self._aplicar_folga_final()
         manter = None
         if manter_indice and manter_indice != "fim":
@@ -2217,7 +2252,6 @@ class TelaLeitor(ctk.CTkFrame):
     def _simular_folhas(self, inicio, parar_em=None):
         """Inicios de folha a partir de `inicio` ate o fim (ou ate `parar_em`)."""
         self.txt.yview(f"1.0+{inicio}c")
-        self.txt.update_idletasks()
         grade = [inicio]
         for _ in range(600):
             if parar_em is not None and grade[-1] >= parar_em:
@@ -2235,7 +2269,6 @@ class TelaLeitor(ctk.CTkFrame):
                 break
             grade.append(offset)
             self.txt.yview(proxima)
-            self.txt.update_idletasks()
         return grade
 
     def _aplicar_folga_final(self):
@@ -2280,7 +2313,6 @@ class TelaLeitor(ctk.CTkFrame):
         self._simulando = True
         try:
             self.txt.yview(f"1.0+{grade[indice]}c")
-            self.txt.update_idletasks()
         finally:
             self._simulando = False
         self._atualizar_mascara()
@@ -2386,7 +2418,6 @@ class TelaLeitor(ctk.CTkFrame):
             self._mascara_par.lift()
             return
         self._par.yview(f"1.0+{grade[seguinte]}c")
-        self._par.update_idletasks()
         corte = None
         if seguinte + 1 < len(grade):
             info = self._par.dlineinfo(f"1.0+{grade[seguinte + 1]}c")
@@ -2574,6 +2605,10 @@ class TelaLeitor(ctk.CTkFrame):
             self._agendado_folha = self.after(120, self._folha_apos_mudanca)
 
     def _ao_mover_visao(self, primeiro, ultimo):
+        if self._simulando:
+            # Durante a montagem das folhas a visao pula dezenas de vezes;
+            # reagir a cada pulo custava ~1 s por montagem.
+            return
         # Mantem a barra de rolagem do CustomTkinter funcionando...
         try:
             self.area._y_scrollbar.set(primeiro, ultimo)
@@ -4194,7 +4229,10 @@ class TelaLeitor(ctk.CTkFrame):
 
     def _atualizar_status_ia(self):
         try:
-            self.lbl_ia_status.configure(text=f"Provedor: {self.ia_manager.descrever_fila()}")
+            # Versao rapida: a completa pode ligar a IA local e congelar a
+            # janela ate o modelo carregar.
+            self.lbl_ia_status.configure(
+                text=f"Provedor: {self.ia_manager.descrever_fila_rapido()}")
         except Exception:
             pass
 

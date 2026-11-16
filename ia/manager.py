@@ -135,6 +135,42 @@ class AIManager:
         fila.append(("Modo offline", self.offline))
         return fila
 
+    def descrever_fila_rapido(self):
+        """A mesma ordem de `descrever_fila`, sem sondar porta nem ligar nada.
+
+        E a versao para a interface. A completa chama `descobrir()`, que pode
+        SUBIR o motor da IA local e esperar o modelo carregar (segundos, ou
+        dezenas de segundos numa maquina modesta) -- chamada na abertura do
+        livro, congelava a janela inteira ate o motor responder.
+        """
+        from ia import local
+        preferido = self.config.obter_provedor()
+        nuvem = []
+        for nome, padrao in (("Claude", ClaudeProvider.MODELO_PADRAO),
+                             ("OpenAI", OpenAIProvider.MODELO_PADRAO),
+                             ("Gemini", GeminiProvider.MODELO_PADRAO)):
+            if (self.config.obter_chave(nome) or "").strip():
+                nuvem.append((nome, f"{nome} · {_curto(self._modelo(nome) or padrao)}"))
+        nuvem.sort(key=lambda item: item[0] != preferido)
+        nomes = [rotulo for _n, rotulo in nuvem]
+
+        rotulo_local = None
+        if self._descoberta:
+            rotulo_local = f"{self._descoberta[0]} · {_curto(self._descoberta[3])}"
+        else:
+            try:
+                if local.instalado():
+                    rotulo_local = "IA local (liga na 1a pergunta)"
+            except Exception:
+                rotulo_local = None
+        if rotulo_local:
+            if preferido in ("Local", "Ollama", "Offline") or not nuvem:
+                nomes.insert(0, rotulo_local)
+            else:
+                nomes.append(rotulo_local)
+        nomes.append("Modo offline")
+        return " → ".join(nomes)
+
     def descrever_fila(self):
         nomes = []
         for nome, provedor in self._montar_fila():

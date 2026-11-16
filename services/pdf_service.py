@@ -37,6 +37,12 @@ def abrir(caminho: str, senha: str = None, usar_guardada: bool = True):
     leitor, capa, metadados e buscas abrem o livro sem saber que ele tem
     senha. Se nenhuma servir, o documento volta trancado: use `bloqueado()`.
     """
+    paginado = epub_pronto(caminho)
+    if paginado:
+        try:
+            return fitz.open(paginado)
+        except Exception:
+            pass                       # cache corrompido: cai no EPUB
     doc = fitz.open(caminho)
     if bloqueado(doc):
         candidatas = [senha] if senha else []
@@ -48,6 +54,199 @@ def abrir(caminho: str, senha: str = None, usar_guardada: bool = True):
     if doc.is_reflowable:
         doc.layout(**_LAYOUT_REFLUIVEL)
     return doc
+
+
+# ------------------------------------------------------- EPUB JA PAGINADO
+# Abrir um EPUB obriga o MuPDF a paginar o livro INTEIRO (674 paginas: 1 a 2 s
+# de CPU) -- e o leitor abre o arquivo varias vezes (tela, indice, analise,
+# busca). Como o MuPDF segura o Python enquanto pagina, cada abertura, mesmo
+# em segundo plano, congelava a janela. A saida: paginar UMA vez, ao importar,
+# e guardar o resultado como PDF (abre em milissegundos, mesmas paginas).
+#
+# A paginacao roda num PROCESSO separado: numa thread ela seguraria o Python
+# os ~8 s inteiros e a janela pararia do mesmo jeito.
+_VERSAO_PAGINACAO = "a5v1"            # muda se _LAYOUT_REFLUIVEL mudar
+_PRODUTOR_EPUB = "Lumina EPUB paginado"
+_em_preparo = set()
+_trava_preparo = threading.Lock()
+
+
+def _pasta_epub():
+    from configuracoes import user_path
+    pasta = user_path("epub_paginado")
+    os.makedirs(pasta, exist_ok=True)
+    return pasta
+
+
+def caminho_cache_epub(caminho):
+    ident = PDFService.gerar_id_unico(caminho)
+    return os.path.join(_pasta_epub(), f"{ident}_{_VERSAO_PAGINACAO}.pdf")
+
+
+def epub_pronto(caminho):
+    if not str(caminho).lower().endswith(".epub"):
+        return None
+    try:
+        destino = caminho_cache_epub(caminho)
+        return destino if os.path.exists(destino) else None
+    except Exception:
+        return None
+
+
+def veio_de_epub(doc) -> bool:
+    """O documento e um EPUB (direto ou ja paginado)? Ai nao ha cabecalho
+    nem rodape de verdade, e o texto pode passar da margem da pagina."""
+    try:
+        if doc.is_reflowable:
+            return True
+        return (doc.metadata or {}).get("producer", "").startswith(_PRODUTOR_EPUB)
+    except Exception:
+        return False
+
+
+# Ligaduras: ao converter, o MuPDF grava "fi", "fl", "ff" como um caractere
+# so (U+FB01...) e TODO hifen como inseparavel (U+2011). Pior: com algumas
+# fontes a ligadura "ft" sai com um caractere qualquer ("soƤware"). As padrao
+# vao numa tabela fixa; as da fonte sao descobertas na conversao (comparando
+# com o texto do EPUB) e gravadas DENTRO do PDF, no campo `keywords`.
+_LIGADURAS_PADRAO = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi",
+                     "ﬄ": "ffl", "ﬅ": "st", "ﬆ": "st", "‑": "-"}
+_MARCA_LIGADURAS = "lumina-ligaduras:"
+
+
+def _descobrir_ligaduras(epub, pdf):
+    """{caractere errado: texto certo} comparando paginas de amostra."""
+    import difflib
+    from collections import Counter
+    contagem = Counter()
+    padrao = str.maketrans(_LIGADURAS_PADRAO)
+    # Todas as paginas, mas o diff (caro) so roda onde aparece um caractere
+    # que nao existe no EPUB -- as trocas raras (a ligadura do negrito, por
+    # exemplo) escapavam de uma amostra.
+    for numero in range(len(epub)):
+        try:
+            a = epub.load_page(numero).get_text().replace("­", "").replace("\xa0", " ")
+            b = pdf.load_page(numero).get_text().translate(padrao).replace("\xa0", " ")
+        except Exception:
+            continue
+        if not any(not ch.isascii() for ch in set(b) - set(a)):
+            continue
+        for op, i1, i2, j1, j2 in difflib.SequenceMatcher(
+                None, a, b, autojunk=False).get_opcodes():
+            if (op == "replace" and j2 - j1 == 1 and 2 <= i2 - i1 <= 3
+                    and a[i1:i2].isalpha() and not b[j1:j2].isascii()):
+                contagem[(b[j1:j2], a[i1:i2])] += 1
+    tabela = {}
+    for (errado, certo), vezes in contagem.most_common():
+        if errado not in tabela:
+            tabela[errado] = certo
+    return tabela
+
+
+def tabela_de_texto(doc):
+    """Tabela de `str.translate` que conserta o texto de um EPUB paginado.
+
+    None para qualquer outro documento (nada a consertar). Fica guardada no
+    proprio objeto: e consultada a cada pagina extraida.
+    """
+    tabela = getattr(doc, "_lumina_tabela", False)
+    if tabela is not False:
+        return tabela
+    tabela = None
+    try:
+        meta = doc.metadata or {}
+        if meta.get("producer", "").startswith(_PRODUTOR_EPUB):
+            mapa = dict(_LIGADURAS_PADRAO)
+            chaves = meta.get("keywords") or ""
+            if _MARCA_LIGADURAS in chaves:
+                import json
+                mapa.update(json.loads(chaves.split(_MARCA_LIGADURAS, 1)[1]))
+            tabela = str.maketrans(mapa)
+    except Exception:
+        tabela = None
+    try:
+        doc._lumina_tabela = tabela
+    except Exception:
+        pass
+    return tabela
+
+
+def texto_da_pagina(doc, numero):
+    """Texto puro de uma pagina, ja consertado (use no lugar de get_text)."""
+    texto = doc.load_page(numero).get_text("text")
+    tabela = tabela_de_texto(doc)
+    return texto.translate(tabela) if tabela else texto
+
+
+def converter_epub(entrada, saida):
+    """Pagina o EPUB e grava como PDF (sumario e metadados preservados).
+
+    Chamada pelo processo auxiliar (`Lumina.exe --paginar-epub ...`).
+    """
+    import json
+    doc = fitz.open(entrada)
+    doc.layout(**_LAYOUT_REFLUIVEL)
+    pdf = fitz.open("pdf", doc.convert_to_pdf())
+    try:
+        pdf.set_toc(doc.get_toc())
+    except Exception:
+        pass
+    meta = {k: v for k, v in (doc.metadata or {}).items()
+            if k in ("title", "author", "subject") and v}
+    meta["producer"] = _PRODUTOR_EPUB
+    meta["keywords"] = _MARCA_LIGADURAS + json.dumps(_descobrir_ligaduras(doc, pdf))
+    pdf.set_metadata(meta)
+    temporario = saida + ".parcial"
+    pdf.save(temporario, garbage=3, deflate=True)
+    pdf.close()
+    doc.close()
+    os.replace(temporario, saida)
+
+
+def preparar_epub(caminho, ao_terminar=None):
+    """Garante o EPUB paginado em segundo plano. Nao bloqueia.
+
+    `ao_terminar(ok)` e chamado numa thread de trabalho (quem chama leva para
+    a interface). Se ja estiver pronto, chama na hora com True.
+    """
+    if not str(caminho).lower().endswith(".epub"):
+        return
+    if epub_pronto(caminho):
+        if ao_terminar:
+            ao_terminar(True)
+        return
+    with _trava_preparo:
+        if caminho in _em_preparo:
+            return
+        _em_preparo.add(caminho)
+
+    def trabalhador():
+        import subprocess
+        import sys
+        ok = False
+        try:
+            destino = caminho_cache_epub(caminho)
+            if getattr(sys, "frozen", False):
+                comando = [sys.executable, "--paginar-epub", caminho, destino]
+            else:
+                raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                comando = [sys.executable, os.path.join(raiz, "main.py"),
+                           "--paginar-epub", caminho, destino]
+            # subprocess.run espera SEM segurar o Python: a janela segue viva.
+            # Sem a splash do executavel: o processo auxiliar nao tem janela.
+            ambiente = dict(os.environ, PYINSTALLER_SUPPRESS_SPLASH_SCREEN="1")
+            subprocess.run(comando, timeout=600, env=ambiente,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            ok = os.path.exists(destino)
+        except Exception as erro:
+            print(f"[PDFService] Paginacao do EPUB falhou: {erro}")
+        finally:
+            with _trava_preparo:
+                _em_preparo.discard(caminho)
+        if ao_terminar:
+            ao_terminar(ok)
+
+    threading.Thread(target=trabalhador, daemon=True, name="paginar-epub").start()
 
 
 def bloqueado(doc) -> bool:
@@ -255,7 +454,7 @@ class PDFService:
             if cancelar is not None and cancelar.is_set():
                 break
             try:
-                texto = documento.load_page(numero).get_text("text")
+                texto = texto_da_pagina(documento, numero)
             except Exception:
                 continue
             if not texto:
@@ -298,7 +497,7 @@ class PDFService:
         lidas = 0
         for i in indices:
             try:
-                soma += len(documento.load_page(i).get_text("text").split())
+                soma += len(texto_da_pagina(documento, i).split())
                 lidas += 1
             except Exception:
                 continue
