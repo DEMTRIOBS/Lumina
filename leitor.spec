@@ -36,6 +36,23 @@ a = Analysis(
         "PIL._tkinter_finder",     # necessario para ImageTk dentro do bundle
         "fitz",
         "requests",
+        # OCR do Windows (services/ocr.py). Importados so dentro de funcoes,
+        # entao ficam explicitos aqui. Os "_table.pywinrt" de cada namespace
+        # (sem eles o import falha no exe) vem do hook que o proprio
+        # winrt-runtime registra no PyInstaller -- nada a coletar a mao.
+        "services.ocr",
+        "winrt.runtime",
+        "winrt.windows.foundation",
+        "winrt.windows.foundation.collections",
+        "winrt.windows.globalization",
+        "winrt.windows.graphics.imaging",
+        "winrt.windows.media.ocr",
+        "winrt.windows.storage.streams",
+        # Arrastar e soltar (main.py importa dentro de try). A DLL e os .tcl
+        # do tkdnd -- so a pasta da plataforma do build, ex. tkdnd/win-x64 --
+        # vem do hook que o proprio tkinterdnd2 registra no PyInstaller
+        # (entry point "pyinstaller40"); nada a coletar a mao.
+        "tkinterdnd2",
     ],
     hookspath=[],
     runtime_hooks=[],

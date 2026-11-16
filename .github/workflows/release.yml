@@ -1,7 +1,9 @@
 name: Release
 
 # Publicar uma versao:  git tag v2.1  &&  git push origin v2.1
-# O GitHub compila o Lumina.exe e anexa a pagina de Releases.
+# O GitHub compila o Lumina.exe (portatil) e o LuminaSetup-<versao>.exe
+# (instalador) e anexa os dois a pagina de Releases. O atualizador do app
+# procura exatamente esses nomes: nao renomeie os arquivos.
 on:
   push:
     tags: ["v*"]
@@ -30,8 +32,31 @@ jobs:
       - name: Compilar Lumina.exe
         run: python build.py
 
+      # A imagem do runner costuma trazer o Inno Setup 6; quando nao traz,
+      # o Chocolatey (que vem no runner) instala em ~1 min.
+      - name: Localizar ou instalar o Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe nao encontrado" }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Compilar LuminaSetup.exe
+        shell: pwsh
+        run: |
+          # v2.3 -> 2.3: a versao do instalador e a da tag publicada.
+          $versao = "${{ github.ref_name }}".TrimStart("v")
+          & $env:ISCC "/DAppVersion=$versao" installer\lumina.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+
       - name: Publicar na pagina de Releases
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Lumina.exe
+          files: |
+            dist/Lumina.exe
+            dist/LuminaSetup-*.exe
           generate_release_notes: true

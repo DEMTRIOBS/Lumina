@@ -136,7 +136,13 @@ class AIManager:
         return fila
 
     def descrever_fila(self):
-        nomes = [nome for nome, _ in self._montar_fila()]
+        nomes = []
+        for nome, provedor in self._montar_fila():
+            modelo = getattr(provedor, "modelo", None)
+            # Provedores de nuvem: mostra o modelo escolhido (Haiku, Sonnet...).
+            if modelo and nome in ("Claude", "OpenAI", "Gemini"):
+                nome = f"{nome} · {_curto(modelo)}"
+            nomes.append(nome)
         return " → ".join(nomes)
 
     # --------------------------------------------------------------- execucao

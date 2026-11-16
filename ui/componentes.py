@@ -502,3 +502,57 @@ def fechar_modal(modal):
         modal.destroy()
     except Exception:
         pass
+
+
+# ----------------------------------------------------------------- SENHA
+
+def pedir_senha(pai, nome_arquivo, validar):
+    """Pergunta a senha de um PDF protegido e ESPERA a resposta.
+
+    `validar(senha) -> bool` e chamado a cada tentativa; senha errada mantem a
+    janela aberta com o aviso, para tentar de novo. Devolve a senha aceita ou
+    None se o usuario desistir (Cancelar, Esc ou fechar a janela).
+
+    E sincrono (wait_window) de proposito: quem chama esta no meio de um laco
+    adicionando varios arquivos, e cada um precisa da resposta antes de seguir.
+    """
+    modal = ctk.CTkToplevel(pai)
+    preparar_modal(modal, "Arquivo protegido", 440, 250, pai.winfo_toplevel())
+    resultado = {"senha": None}
+
+    corpo = quadro(modal, "transparent")
+    corpo.pack(fill="both", expand=True, padx=ESP["xl"], pady=ESP["xl"])
+    rotulo(corpo, "Arquivo protegido por senha", 16, "bold").pack(fill="x")
+    nome = nome_arquivo if len(nome_arquivo) <= 52 else nome_arquivo[:51] + "…"
+    rotulo(corpo, f"Digite a senha de “{nome}”.\nEla fica guardada cifrada nesta conta "
+                  "do Windows.", 11, "normal", "texto_suave", justify="left").pack(
+        fill="x", pady=(2, ESP["md"]))
+
+    entrada = campo(corpo, "Senha", largura=380, altura=36, show="•")
+    entrada.pack(fill="x")
+    modal.after(320, lambda: entrada.focus_set() if _existe(entrada) else None)
+
+    aviso = rotulo(corpo, "", 10, "normal", "perigo")
+    aviso.pack(fill="x", pady=(ESP["xs"], 0))
+
+    def confirmar(_=None):
+        senha = entrada.get()
+        if not senha:
+            aviso.configure(text="Digite a senha.")
+            return
+        if not validar(senha):
+            aviso.configure(text="Senha incorreta. Tente de novo.")
+            entrada.delete(0, "end")
+            entrada.focus_set()
+            return
+        resultado["senha"] = senha
+        fechar_modal(modal)
+
+    acoes = quadro(corpo, "transparent")
+    acoes.pack(side="bottom", fill="x")
+    botao(acoes, "Abrir", confirmar, largura=130).pack(side="right")
+    botao(acoes, "Cancelar", lambda: fechar_modal(modal), largura=110,
+          variante="secundario").pack(side="right", padx=ESP["sm"])
+    modal.bind("<Return>", confirmar)
+    modal.wait_window()
+    return resultado["senha"]

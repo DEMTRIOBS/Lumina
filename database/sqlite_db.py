@@ -132,6 +132,50 @@ _ESQUEMA = [
         FOREIGN KEY (id_livro) REFERENCES livros (id_livro) ON DELETE CASCADE
     )
     """,
+    # Senha de PDF protegido, cifrada com DPAPI (database/cofre.py) -- nunca
+    # em texto puro. Tabela a parte, e nao coluna em `livros`, por dois
+    # motivos: a senha precisa ser gravada ANTES da linha do livro existir
+    # (metadados e capa so saem depois de destrancar o arquivo), e assim o
+    # `SELECT l.*` da estante nao arrasta o segredo para cada cartao.
+    """
+    CREATE TABLE IF NOT EXISTS senhas_livro (
+        id_livro      TEXT PRIMARY KEY,
+        senha_cifrada TEXT NOT NULL,
+        criado_em     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    # Revisao espacada (services/revisao.py, algoritmo SM-2). Cartao ligado a
+    # um grifo (frente vazia = usa o trecho atual do grifo) ou livre
+    # (id_grifo NULL). Apagar o grifo apaga o cartao junto (CASCADE).
+    """
+    CREATE TABLE IF NOT EXISTS cartoes_revisao (
+        id_cartao       INTEGER PRIMARY KEY AUTOINCREMENT,
+        id_grifo        INTEGER UNIQUE REFERENCES grifos (id_grifo) ON DELETE CASCADE,
+        id_livro        TEXT REFERENCES livros (id_livro) ON DELETE CASCADE,
+        frente          TEXT DEFAULT '',
+        verso           TEXT DEFAULT '',
+        facilidade      REAL DEFAULT 2.5,
+        intervalo_dias  INTEGER DEFAULT 0,
+        repeticoes      INTEGER DEFAULT 0,
+        proxima_revisao TEXT,
+        ultima_revisao  TEXT,
+        criado_em       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    # Diario de leitura: `livros.segundos_lidos` so guarda o total, e
+    # estatistica por dia (sequencia de dias, grafico do mes) precisa da data.
+    # Sem FOREIGN KEY de proposito: remover um livro da estante nao deve
+    # apagar o historico nem quebrar a sequencia de dias lidos.
+    """
+    CREATE TABLE IF NOT EXISTS leitura_diaria (
+        data     TEXT NOT NULL,
+        id_livro TEXT NOT NULL,
+        segundos INTEGER DEFAULT 0,
+        paginas  INTEGER DEFAULT 0,
+        PRIMARY KEY (data, id_livro)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cartoes_proxima ON cartoes_revisao (proxima_revisao)",
     "CREATE INDEX IF NOT EXISTS idx_grifos_pagina ON grifos (id_livro, pagina)",
     "CREATE INDEX IF NOT EXISTS idx_anotacoes_livro ON anotacoes (id_livro)",
     "CREATE INDEX IF NOT EXISTS idx_favoritos_livro ON favoritos (id_livro)",

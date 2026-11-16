@@ -405,6 +405,10 @@ class Bloco:
     # codigo no meio da prosa ("use o metodo list_display"). Deslocamentos de
     # caractere relativos ao texto do bloco.
     mono: List[tuple] = field(default_factory=list)
+    # A ultima palavra do bloco foi partida por hifenizacao ("in-" ... na
+    # pagina seguinte "teligencia"). O leitor usa isso para costurar o
+    # paragrafo que atravessa a quebra de pagina sem espaco no meio.
+    hifen_final: bool = False
 
 
 @dataclass
@@ -421,6 +425,19 @@ class PaginaReflow:
 def _normalizar_assinatura(texto: str) -> str:
     """'Pagina 12' e 'Pagina 87' viram a mesma assinatura."""
     return _RE_DIGITOS.sub("#", texto.strip().lower())[:70]
+
+
+def _recorte(pagina):
+    """Area de extracao. No EPUB, sem recorte: o MuPDF nao quebra blocos
+    <pre>, e a linha de codigo mais larga que a pagina A5 era cortada pelo
+    extrator ("on_delete=models.CAS"). No PDF, a pagina e o limite -- o que
+    fica fora dela e lixo de diagramacao, nao conteudo."""
+    try:
+        if pagina.parent.is_reflowable:
+            return fitz.INFINITE_RECT()
+    except Exception:
+        pass
+    return None
 
 
 def _limpar(texto: str) -> str:
@@ -591,6 +608,11 @@ def _metricas_da_linha(linha):
 class MotorReflow:
     """Mantem as estatisticas de um documento para reusar entre paginas."""
 
+    # Pagina digitalizada vira texto pelo OCR do Windows quando disponivel.
+    # Atributo de classe para a interface poder desligar (e religar) para
+    # todos os documentos de uma vez.
+    ocr_ativo = True
+
     def __init__(self, documento: fitz.Document):
         self.doc = documento
         self.tamanho_corpo = 11.0
@@ -733,7 +755,7 @@ class MotorReflow:
                 # Sem os BYTES das imagens: aqui so interessam geometria e
                 # texto, e decodificar cada figura de 24 paginas era o passo
                 # mais caro da abertura do livro.
-                dados = pagina.get_text("dict", flags=_FLAGS_SEM_IMAGEM)
+                dados = pagina.get_text("dict", flags=_FLAGS_SEM_IMAGEM, clip=_recorte(pagina))
             except Exception:
                 continue
 
@@ -813,6 +835,11 @@ class MotorReflow:
         if paginas_validas >= 3:
             minimo = max(2, int(paginas_validas * _LIMIAR_RECORRENCIA))
             self.recorrentes = {a for a, c in contagem_margem.items() if c >= minimo}
+            # EPUB nao tem cabecalho nem rodape: quem pagina e o MuPDF. O que
+            # se "repete na margem" ali sao titulos de capitulo ("Capitulo 1",
+            # "Capitulo 2" -> mesma assinatura) -- e eles sumiam do livro.
+            if getattr(self.doc, "is_reflowable", False):
+                self.recorrentes = set()
             # O limiar da imagem e mais alto que o do texto: cabecalho se repete
             # em toda pagina, mas uma ilustracao legitima pode reaparecer em
             # varias (o mesmo diagrama retomado a cada secao de um capitulo).
@@ -889,7 +916,7 @@ class MotorReflow:
             # Toda figura e rasterizada da propria pagina (veja `_rasterizar`),
             # entao os bytes embutidos nao servem para nada aqui -- e pedi-los
             # obrigaria a decodificar cada imagem duas vezes.
-            dados = pagina.get_text("dict", flags=_FLAGS_SEM_IMAGEM)
+            dados = pagina.get_text("dict", flags=_FLAGS_SEM_IMAGEM, clip=_recorte(pagina))
         except Exception as erro:
             resultado.blocos.append(Bloco("aviso", f"Nao foi possivel ler esta pagina.\n{erro}"))
             return resultado
@@ -907,6 +934,32 @@ class MotorReflow:
         # imagem renderizada em vez de uma pagina em branco silenciosa.
         if chars < _MIN_CHARS_PAGINA:
             resultado.digitalizada = True
+            # Com OCR, a digitalizacao vira texto de verdade: reflui, justifica,
+            # busca, grifa e le em voz alta. Os blocos reconhecidos passam pelo
+            # MESMO `_blocos_do_bloco` do texto nativo (paragrafos, titulos,
+            # hifenizacao, numero de pagina). Import tardio: o WinRT so e
+            # carregado quando aparece a primeira pagina digitalizada.
+            if self.ocr_ativo:
+                reconhecidos = []
+                try:
+                    from services import ocr
+                    if ocr.disponivel():
+                        for bloco in ocr.blocos_da_pagina(pagina, self.tamanho_corpo):
+                            reconhecidos.extend(self._blocos_do_bloco(bloco, altura))
+                        texto = "\n\n".join(b.texto for b in reconhecidos if b.texto)
+                        # Pouco texto ou letras soltas: foto, ilustracao ou
+                        # quadrinho -- a imagem original e mais fiel.
+                        if len(texto) < _MIN_CHARS_PAGINA or not ocr.parece_texto(texto):
+                            reconhecidos = []
+                except Exception:
+                    reconhecidos = []
+                if reconhecidos:
+                    resultado.blocos.append(Bloco(
+                        "aviso", "Texto reconhecido por OCR — pode conter erros."))
+                    resultado.blocos.extend(reconhecidos)
+                    resultado.texto_puro = texto
+                    resultado.palavras = len(texto.split())
+                    return resultado
             resultado.blocos.append(Bloco(
                 "aviso",
                 "Pagina sem texto selecionavel (imagem ou digitalizacao). Exibindo o original."
@@ -1190,10 +1243,24 @@ class MotorReflow:
     def _montar_bloco(self, linhas, x0_bloco, largura_bloco) -> Optional[Bloco]:
         # Juncao com desfazimento de hifenizacao de fim de linha.
         partes = []
+        hifen_final = False
         for indice, linha in enumerate(linhas):
             texto = linha["texto"].rstrip()
             ultima = indice == len(linhas) - 1
-            if not ultima and re.search(r"[a-zà-ÿ]-$", texto):
+            # Hifen condicional (U+00AD): o EPUB marca as silabas com ele e o
+            # MuPDF o deixa no fim da linha quando parte a palavra ("Co\xad" +
+            # "mo"). E invisivel -- antes so era apagado DEPOIS da juncao, e a
+            # palavra virava "Co mo".
+            if texto.endswith("­"):
+                if ultima:
+                    hifen_final = True
+                partes.append(texto[:-1])
+                continue
+            if re.search(r"[a-zà-ÿ]-$", texto):
+                if ultima:
+                    hifen_final = True
+                    partes.append(texto + " ")
+                    continue
                 proxima = linhas[indice + 1]["texto"].lstrip()
                 if proxima[:1].islower():
                     partes.append(texto[:-1])     # cola sem hifen nem espaco
@@ -1229,7 +1296,7 @@ class MotorReflow:
 
         # ---- classificacao
         if _RE_MARCADOR.match(texto):
-            return Bloco("lista", texto, mono=faixas_mono)
+            return Bloco("lista", texto, mono=faixas_mono, hifen_final=hifen_final)
 
         if tamanho >= corpo * 1.55:
             return Bloco("titulo", texto, nivel=1)
@@ -1246,9 +1313,9 @@ class MotorReflow:
 
         # Bloco inteiro recuado = citacao.
         if recuo > largura_bloco * 0.08 and len(linhas) > 1:
-            return Bloco("citacao", texto, mono=faixas_mono)
+            return Bloco("citacao", texto, mono=faixas_mono, hifen_final=hifen_final)
 
-        return Bloco("paragrafo", texto, mono=faixas_mono)
+        return Bloco("paragrafo", texto, mono=faixas_mono, hifen_final=hifen_final)
 
     # ------------------------------------------------------------------ figuras
     def _figuras_da_pagina(self, pagina, blocos_imagem, blocos_texto,

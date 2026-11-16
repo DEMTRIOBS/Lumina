@@ -3,7 +3,8 @@
 
 Uso:
     venv\\Scripts\\activate
-    python build.py
+    python build.py                 # so o executavel portatil
+    python build.py --instalador    # + dist/LuminaSetup-<versao>.exe (Inno Setup 6)
 
 O resultado fica em  dist/Lumina.exe  e roda em qualquer Windows 10/11
 sem Python instalado. Os dados do usuario (biblioteca, grifos, notas) ficam em
@@ -116,6 +117,41 @@ def compilar():
     return resultado.returncode == 0
 
 
+def localizar_iscc():
+    """Compilador do Inno Setup: PATH ou as pastas de instalacao padrao."""
+    achado = shutil.which("ISCC") or shutil.which("iscc")
+    if achado:
+        return achado
+    candidatos = []
+    for variavel in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
+        base = os.environ.get(variavel)
+        if base:
+            sub = ("Programs", "Inno Setup 6") if variavel == "LOCALAPPDATA" else ("Inno Setup 6",)
+            candidatos.append(os.path.join(base, *sub, "ISCC.exe"))
+    return next((c for c in candidatos if os.path.exists(c)), None)
+
+
+def gerar_instalador():
+    """dist/LuminaSetup-<versao>.exe. Opcional: sem Inno Setup, so avisa --
+    o Lumina.exe portatil ja esta pronto e o build nao deve falhar por isso."""
+    passo("Gerando instalador (Inno Setup)")
+    iscc = localizar_iscc()
+    if not iscc:
+        print("  Inno Setup 6 nao encontrado; instalador nao gerado.")
+        print("  Instale com:  winget install JRSoftware.InnoSetup")
+        print("  (ou baixe em https://jrsoftware.org/isdl.php) e rode de novo.")
+        return True
+    sys.path.insert(0, RAIZ)
+    from configuracoes import APP_VERSAO
+    script = os.path.join(RAIZ, "installer", "lumina.iss")
+    resultado = subprocess.run([iscc, f"/DAppVersion={APP_VERSAO}", script], cwd=RAIZ)
+    if resultado.returncode != 0:
+        print("  ISCC falhou; leia a saida acima.")
+        return False
+    print(f"  {os.path.join(RAIZ, 'dist', f'LuminaSetup-{APP_VERSAO}.exe')}")
+    return True
+
+
 def main():
     os.chdir(RAIZ)
     preparar_icone()
@@ -136,6 +172,8 @@ def main():
         passo("Pronto")
         print(f"  {executavel}  ({tamanho:.1f} MB)")
         print("\n  Pode copiar esse arquivo sozinho para qualquer PC Windows.")
+        if "--instalador" in sys.argv[1:] and not gerar_instalador():
+            return 1
         return 0
 
     print("\nBuild terminou mas o .exe nao foi encontrado.")

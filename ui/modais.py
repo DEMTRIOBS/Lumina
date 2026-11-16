@@ -591,7 +591,7 @@ class Modais:
         Modais._aba_voz(aba_voz, cfg)
         Modais._aba_contexto(aba_ctx, cfg)
         Modais._aba_atalhos(aba_atalhos)
-        Modais._aba_sobre(aba_sobre)
+        Modais._aba_sobre(aba_sobre, cfg)
         return modal
 
     @staticmethod
@@ -640,6 +640,7 @@ class Modais:
             fill="x", pady=(0, ESP["sm"]))
 
         entradas = {}
+        modelos_escolhidos = {}
         provedores = [
             ("Claude", "Anthropic — cole a chave que comeca com sk-ant-"),
             ("OpenAI", "Chave da OpenAI, comeca com sk-"),
@@ -661,8 +662,9 @@ class Modais:
             C.botao_icone(linha, "visivel", alternar_visibilidade, "Mostrar/ocultar",
                           tamanho=30).pack(side="left")
             C.rotulo(bloco, dica, 9, "normal", "texto_suave").pack(
-                fill="x", padx=ESP["md"], pady=(0, ESP["sm"]))
+                fill="x", padx=ESP["md"], pady=(0, ESP["xs"]))
             entradas[nome] = entrada
+            Modais._seletor_de_modelo(bloco, cfg, nome, modelos_escolhidos)
 
         status = C.rotulo(area, "", 10, "normal", "texto_suave")
         status.pack(fill="x", pady=ESP["sm"])
@@ -670,6 +672,8 @@ class Modais:
         def salvar():
             for nome, entrada in entradas.items():
                 cfg.definir_chave(nome, entrada.get().strip())
+            for nome, obter in modelos_escolhidos.items():
+                cfg.definir(f"modelo_{nome}", obter())
             status.configure(text="Preferencias salvas.", text_color=T.sucesso)
 
         def testar():
@@ -685,6 +689,47 @@ class Modais:
         C.botao(acoes, "Salvar", salvar, largura=130).pack(side="right")
         C.botao(acoes, "Testar provedores", testar, largura=160,
                 variante="secundario").pack(side="right", padx=ESP["sm"])
+
+    @staticmethod
+    def _seletor_de_modelo(bloco, cfg, provedor, modelos_escolhidos):
+        """Linha "Modelo: [Haiku | Sonnet | Opus | Outro…]" de um provedor.
+
+        O modelo leve custa uma fracao e responde bem resumo, flashcard e
+        pergunta sobre o livro; o maior so compensa em raciocinio longo. A
+        escolha e de quem paga a conta. "Outro…" aceita qualquer nome que o
+        provedor publicar depois desta versao.
+        """
+        from ia.providers import MODELOS
+        opcoes = MODELOS.get(provedor, [])
+        rotulos = [r for _m, r in opcoes] + ["Outro (digitar o nome)…"]
+        por_rotulo = {r: m for m, r in opcoes}
+        atual = (cfg.obter(f"modelo_{provedor}", "") or "").strip()
+        padrao = {"Claude": "claude-opus-5-5", "OpenAI": "gpt-4o-mini",
+                  "Gemini": "gemini-flash-latest"}.get(provedor, "")
+        conhecido = next((r for m, r in opcoes if m == (atual or padrao)), None)
+
+        linha = C.quadro(bloco, "transparent")
+        linha.pack(fill="x", padx=ESP["md"], pady=(0, ESP["sm"]))
+        C.rotulo(linha, "Modelo", 11, "normal", "texto_suave", width=70).pack(side="left")
+        livre = C.campo(linha, "ex.: claude-haiku-4-5", largura=180)
+        if atual and not conhecido:
+            livre.insert(0, atual)
+
+        def trocar(valor):
+            if valor in por_rotulo:
+                livre.pack_forget()
+            else:
+                livre.pack(side="left", padx=ESP["sm"])
+
+        seletor = C.seletor(linha, rotulos, trocar, largura=250,
+                            valor=conhecido or rotulos[-1])
+        seletor.pack(side="left", padx=ESP["sm"])
+        trocar(seletor.get())
+
+        def escolhido():
+            valor = seletor.get()
+            return por_rotulo.get(valor) or livre.get().strip()
+        modelos_escolhidos[provedor] = escolhido
 
     # ------------------------------------------------------------- ia local
     @staticmethod
@@ -1099,10 +1144,12 @@ class Modais:
                     side="left", padx=(0, ESP["md"]))
 
     @staticmethod
-    def _aba_sobre(pai):
+    def _aba_sobre(pai, cfg=None):
         from core.branding import carregar_arte, carregar_logo
 
-        area = C.quadro(pai, "superficie")
+        # Rolavel: com o bloco de atualizacao, o conteudo passa da altura do
+        # modal em telas com escala de 125-150%.
+        area = C.rolavel(pai, "superficie")
         area.pack(fill="both", expand=True)
 
         # A arte completa ja traz o nome e o "PDF READER"; sem ela, cai no
@@ -1131,3 +1178,189 @@ class Modais:
 
         C.rotulo(area, f"Seus dados ficam em:\n{user_path()}", 9, "normal", "texto_suave",
                  ancora="center", justify="center").pack(pady=ESP["xl"])
+        Modais._bloco_atualizacao(area, cfg)
+
+    # =====================================================================
+    # ATUALIZACAO
+    # =====================================================================
+    @staticmethod
+    def _bloco_atualizacao(area, cfg):
+        """Interruptor da verificacao diaria + botao "Procurar atualizacoes"."""
+        caixa = C.quadro(area, "superficie_alt", raio=RAIO["sm"])
+        caixa.pack(fill="x", padx=ESP["lg"], pady=(0, ESP["md"]))
+
+        if cfg is not None:
+            from services import atualizacao as at
+            variavel = ctk.StringVar(value="1" if cfg.obter_bool(at.CHAVE_ATIVA, True) else "0")
+            chave = ctk.CTkSwitch(
+                caixa, text="Verificar atualizacoes automaticamente", variable=variavel,
+                onvalue="1", offvalue="0",
+                command=lambda: cfg.definir(at.CHAVE_ATIVA, variavel.get()),
+                font=ctk.CTkFont(FONTE_UI, 12, "bold"), text_color=T.texto,
+                progress_color=T.destaque, button_color=T.superficie,
+                fg_color=T.superficie)
+            C.registrar_estilo(chave, text_color="texto", progress_color="destaque",
+                               button_color="superficie", fg_color="superficie")
+            chave.pack(fill="x", padx=ESP["md"], pady=(ESP["sm"], 2))
+            C.rotulo(caixa, "Uma consulta anonima por dia a pagina de Releases do GitHub. "
+                            "Nada e instalado sem voce clicar em Atualizar.",
+                     10, "normal", "texto_suave", wraplength=480,
+                     justify="left").pack(fill="x", padx=ESP["md"])
+
+        linha = C.quadro(caixa, "transparent")
+        linha.pack(fill="x", padx=ESP["md"], pady=ESP["sm"])
+        estado = C.rotulo(caixa, "", 10, "normal", "texto_suave", wraplength=480,
+                          justify="left")
+        barra = C.BarraProgresso(caixa, fundo="superficie_alt", trilho="superficie")
+        achada = {"novidade": None}
+
+        def vivo():
+            try:
+                return bool(caixa.winfo_exists())
+            except Exception:
+                return False
+
+        def mostrar(texto, cor="texto_suave"):
+            if vivo():
+                estado.configure(text=texto, text_color=getattr(T, cor))
+                estado.pack(fill="x", padx=ESP["md"], pady=(0, ESP["sm"]))
+
+        def procurar():
+            from services import atualizacao as at
+            botao.configure(state="disabled")
+            mostrar("Consultando o GitHub…")
+
+            def terminou(novidade, erro):
+                def aplicar():
+                    if not vivo():
+                        return
+                    botao.configure(state="normal")
+                    if erro is not None:
+                        mostrar(f"Nao foi possivel consultar: {erro}", "perigo")
+                    elif novidade is None:
+                        mostrar(f"Voce ja esta na versao mais recente ({APP_VERSAO}).", "sucesso")
+                    else:
+                        achada["novidade"] = novidade
+                        if novidade.pode_instalar:
+                            mostrar(f"Versao {novidade.versao} disponivel.", "destaque")
+                            botao.configure(text="Atualizar agora", command=atualizar)
+                        else:
+                            mostrar(f"Versao {novidade.versao} disponivel. Rodando do "
+                                    "codigo-fonte: atualize com git pull.", "destaque")
+                            botao.configure(text="Abrir pagina da versao", command=atualizar)
+
+                try:
+                    caixa.after(0, aplicar)
+                except Exception:
+                    pass
+
+            if cfg is not None:
+                at.registrar_verificacao(cfg)
+            at.verificar_em_segundo_plano(terminou)
+
+        def atualizar():
+            botao.configure(state="disabled")
+            barra.pack(fill="x", padx=ESP["md"], pady=(0, ESP["sm"]))
+
+            def progresso(fracao, texto):
+                if vivo():
+                    barra.set(fracao)
+                    mostrar(texto)
+
+            def falhou(mensagem):
+                if vivo():
+                    barra.pack_forget()
+                    botao.configure(state="normal", text="Tentar de novo")
+                    mostrar(mensagem, "perigo")
+
+            Modais.iniciar_atualizacao(caixa, achada["novidade"], progresso, falhou)
+
+        botao = C.botao(linha, "Procurar atualizacoes", procurar, largura=190,
+                        variante="secundario")
+        botao.pack(side="left")
+
+    @staticmethod
+    def iniciar_atualizacao(widget, novidade, ao_progredir, ao_falhar):
+        """Baixa e aplica a versao nova; dando certo, fecha o Lumina (o .cmd
+        de troca reabre). Os callbacks rodam na thread do Tk.
+
+        Do codigo-fonte nao ha o que trocar: abre a pagina da versao.
+        """
+        from services import atualizacao as at
+        if not novidade.pode_instalar:
+            import webbrowser
+            webbrowser.open(novidade.pagina)
+            return
+        raiz = widget._root()
+
+        def na_interface(funcao):
+            try:
+                raiz.after(0, funcao)
+            except Exception:
+                pass
+
+        def progresso(fracao, texto):
+            na_interface(lambda: ao_progredir(fracao, texto))
+
+        def terminou(ok, mensagem):
+            def aplicar():
+                if not ok:
+                    ao_falhar(mensagem)
+                    return
+                ao_progredir(1.0, mensagem)
+                # _ao_fechar grava progresso e geometria antes de sair; o .cmd
+                # espera este processo terminar para trocar o executavel.
+                fechar = getattr(raiz, "_ao_fechar", None) or raiz.destroy
+                raiz.after(600, fechar)
+            na_interface(aplicar)
+
+        ao_progredir(0.0, "Baixando…")
+        at.baixar_e_aplicar_em_segundo_plano(novidade, progresso, terminou)
+
+    @staticmethod
+    def faixa_atualizacao(raiz, novidade):
+        """Aviso discreto no topo da janela: "Lumina X disponivel [Atualizar]".
+
+        Nao e modal nem rouba foco: quem esta no meio de um capitulo fecha com
+        "Depois" e so ve de novo no dia seguinte.
+        """
+        faixa = C.quadro(raiz, "superficie_alt", raio=RAIO["pill"],
+                         border_width=1, border_color=T.borda)
+        texto = C.rotulo(faixa, f"{APP_NOME} {novidade.versao} disponivel", 12, "bold")
+        texto.pack(side="left", padx=(ESP["lg"], ESP["md"]), pady=ESP["sm"])
+
+        def fechar():
+            try:
+                faixa.destroy()
+            except Exception:
+                pass
+
+        def progresso(fracao, mensagem):
+            try:
+                texto.configure(text=mensagem)
+            except Exception:
+                pass
+
+        def falhou(mensagem):
+            try:
+                texto.configure(text=mensagem, text_color=T.perigo)
+                botao.configure(state="normal", text="Tentar de novo")
+            except Exception:
+                pass
+
+        def atualizar():
+            if novidade.pode_instalar:
+                botao.configure(state="disabled")
+            Modais.iniciar_atualizacao(faixa, novidade, progresso, falhou)
+            if not novidade.pode_instalar:
+                fechar()
+
+        rotulo_botao = "Atualizar" if novidade.pode_instalar else "Ver novidades"
+        botao = C.botao(faixa, rotulo_botao, atualizar, largura=100, altura=28)
+        botao.pack(side="left", pady=ESP["xs"])
+        C.botao(faixa, "Depois", fechar, largura=70, altura=28,
+                variante="fantasma").pack(side="left", padx=(ESP["xs"], ESP["sm"]),
+                                          pady=ESP["xs"])
+        faixa.place(relx=0.5, y=ESP["md"], anchor="n")
+        faixa.lift()
+        return faixa

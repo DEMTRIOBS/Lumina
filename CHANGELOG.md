@@ -1,5 +1,65 @@
 # Changelog
 
+## 2.3 — 2026-11-16
+
+### Leitura
+- **O texto flui entre as paginas.** Nos modos Rolagem continua, Folhear e
+  Automatica a tela monta um trecho de paginas seguidas: sem buraco no fim
+  de cada pagina, e o paragrafo cortado pela quebra de pagina e costurado
+  ("...ou in" | "teligencia" vira "ou inteligencia", sem recuo falso). Grifos,
+  notas e progresso continuam por pagina; a pagina atual e a do topo da tela.
+- **Palavras partidas no EPUB** ("Co mo", "te clado") corrigidas: o hifen
+  invisivel (U+00AD) agora e tratado na juncao das linhas.
+- **Duas folhas lado a lado** no Folhear em janela larga, como um livro aberto.
+- **Deslize** de ~120 ms ao virar a folha (desligavel no Ctrl+P).
+- Codigo de EPUB nao e mais cortado na margem direita; linha longa quebra com
+  recuo, como no word wrap dos editores.
+- Titulos de capitulo de EPUB nao somem mais como "cabecalho repetido".
+- Justificacao aceita um pouco mais de folga: menos linhas irregulares em
+  coluna estreita.
+
+### Estudo
+- **Relacionar com meu codigo (VS Code):** acao do assistente que le o
+  arquivo aberto no VS Code (do disco, pelo titulo da janela) e explica a
+  pagina do livro aplicada a ele. Pede confirmacao no primeiro uso.
+- **Enviar ao VS Code:** botao em cada bloco de codigo copia o trecho limpo e
+  traz o VS Code para a frente.
+- **Dicionario e traducao** da selecao (Free Dictionary, Wiktionary, MyMemory
+  — gratuitos, sem chave).
+- **Revisao espacada** (SM-2, como no Anki): cada grifo vira um cartao que
+  volta no dia certo (`Ctrl+R`), e **estatisticas**: dias seguidos, minutos
+  por dia, ritmo e tempo por livro.
+
+### Arquivos
+- **PDF com senha:** pede a senha uma vez e guarda cifrada pelo Windows
+  (DPAPI, so a sua conta decifra).
+- **Arrastar e soltar** PDF/EPUB (ou pastas) na estante.
+- **Selecao multipla** na estante (Ctrl/Shift+clique): mover, remover e
+  marcar como lido de uma vez.
+- **OCR** de paginas digitalizadas com o reconhecedor do proprio Windows
+  (gratuito, sem download; ~150-300 ms por pagina).
+
+### IA
+- **Escolha do modelo** de cada provedor em Configuracoes > IA: Claude Haiku
+  5.5 / Sonnet 5.5 / Opus 5.5, GPT-4o mini / GPT-6 Luna, Gemini Flash-Lite /
+  Flash / Pro, ou qualquer nome no campo "Outro".
+
+### Distribuicao
+- **Instalador** (`LuminaSetup-x.y.exe`, Inno Setup): instala por usuário e
+  sem UAC em `%LOCALAPPDATA%\Programs\Lumina`, atalho no menu Iniciar
+  (área de trabalho opcional) e desinstalador. O executável portátil
+  continua publicado.
+- **Abrir com**: PDF e EPUB passam a listar o Lumina no *Abrir com* e em
+  *Aplicativos padrão*, sem trocar o leitor de PDF padrão; opção na
+  instalação para tornar o Lumina o leitor padrão de EPUB.
+- **Atualização automática**: uma consulta anônima por dia às Releases do
+  GitHub; havendo versão nova, um aviso com **Atualizar** baixa o arquivo
+  certo (instalador para quem instalou, `.exe` para o portátil), confere o
+  sha256, fecha, troca e reabre. Interruptor e botão "Procurar atualizações"
+  em *Configurações → Sobre*.
+- Release do GitHub agora anexa `Lumina.exe` e `LuminaSetup-x.y.exe`;
+  `python build.py --instalador` gera o instalador localmente.
+
 ## 2.2 — 2026-11-16
 
 ### Leitura

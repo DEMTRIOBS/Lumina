@@ -25,6 +25,17 @@ from ui.leitor import TelaLeitor
 # Largura do "modo coluna", em pixels fisicos de tela.
 LARGURA_COLUNA_DOCK = 500
 
+# Arrastar PDFs do Explorer para a estante (tkinterdnd2). Opcional: se o
+# pacote ou a DLL do tkdnd faltarem, o app abre normalmente, sem arrastar.
+try:
+    from tkinterdnd2 import TkinterDnD as _TkinterDnD
+    _MixinDnD = _TkinterDnD.DnDWrapper
+except Exception:
+    _TkinterDnD = None
+
+    class _MixinDnD:
+        pass
+
 
 def _fechar_splash_do_executavel():
     """Fecha a tela de abertura do bootloader do PyInstaller.
@@ -39,11 +50,18 @@ def _fechar_splash_do_executavel():
         pass
 
 
-class App(ctk.CTk):
+class App(ctk.CTk, _MixinDnD):
 
     def __init__(self):
         super().__init__()
         self.withdraw()                     # so aparece depois de tudo pronto
+        self.dnd_disponivel = False
+        if _TkinterDnD is not None:
+            try:
+                _TkinterDnD._require(self)
+                self.dnd_disponivel = True
+            except Exception as erro:
+                print(f"[App] Arrastar e soltar indisponivel: {erro}")
 
         inicializar_banco()
         self.banco_config = BancoConfig()
@@ -119,6 +137,22 @@ class App(ctk.CTk):
         pdfs = [a for a in sys.argv[1:] if eh_livro(a)]
         if pdfs:
             self.after(200, lambda: self.abrir_arquivo(pdfs[0]))
+        # Atualizacao: alguns segundos depois de abrir, para a consulta de
+        # rede nao competir com o carregamento do livro.
+        self.after(5000, self._verificar_atualizacao)
+
+    def _verificar_atualizacao(self):
+        try:
+            from services import atualizacao
+            from ui.modais import Modais
+
+            def encontrou(novidade):
+                # Chega na thread de rede: a faixa e montada na thread do Tk.
+                self.after(0, lambda: Modais.faixa_atualizacao(self, novidade))
+
+            atualizacao.verificacao_automatica(self.banco_config, encontrou)
+        except Exception as erro:
+            print(f"[App] Verificacao de atualizacao falhou: {erro}")
 
     def abrir_arquivo(self, caminho):
         """Adiciona o PDF a estante (se ainda nao estiver) e abre na leitura."""
@@ -129,12 +163,12 @@ class App(ctk.CTk):
             return
         try:
             id_livro = self.pdf_service.gerar_id_unico(caminho)
+            # PDF protegido: pede a senha (e a lembra, cifrada) em vez de recusar.
+            if not self.telas["estante"].desbloquear(caminho):
+                return
             if self.banco.existe(id_livro):
                 self.banco.definir_caminho(id_livro, caminho)
             else:
-                if self.pdf_service.esta_protegido(caminho):
-                    C.Toast.mostrar(self, "Arquivo protegido por senha.", "erro")
-                    return
                 meta = self.pdf_service.extrair_metadados(caminho)
                 capa = self.pdf_service.extrair_capa(caminho, id_livro)
                 self.banco.adicionar_livro(id_livro, caminho, capa, meta["titulo"],

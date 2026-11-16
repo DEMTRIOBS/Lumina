@@ -29,12 +29,78 @@ def eh_livro(caminho) -> bool:
     return str(caminho).lower().endswith(EXTENSOES)
 
 
-def abrir(caminho: str):
-    """Abre PDF ou EPUB. Use SEMPRE isto no lugar de fitz.open."""
+def abrir(caminho: str, senha: str = None, usar_guardada: bool = True):
+    """Abre PDF ou EPUB. Use SEMPRE isto no lugar de fitz.open.
+
+    PDF protegido e destrancado aqui, com a senha informada ou com a que o
+    usuario ja digitou uma vez (memoria da sessao ou banco, cifrada). Assim
+    leitor, capa, metadados e buscas abrem o livro sem saber que ele tem
+    senha. Se nenhuma servir, o documento volta trancado: use `bloqueado()`.
+    """
     doc = fitz.open(caminho)
+    if bloqueado(doc):
+        candidatas = [senha] if senha else []
+        if usar_guardada and not candidatas:
+            candidatas.append(_senha_guardada(caminho))
+        for tentativa in candidatas:
+            if tentativa and doc.authenticate(tentativa):
+                break
     if doc.is_reflowable:
         doc.layout(**_LAYOUT_REFLUIVEL)
     return doc
+
+
+def bloqueado(doc) -> bool:
+    """Documento ainda pede senha para ser lido.
+
+    `needs_pass` continua verdadeiro mesmo DEPOIS de `authenticate()` dar
+    certo; quem diz se o conteudo ja esta acessivel e `is_encrypted`. E PDF
+    so com senha de dono (restricao de impressao, copia) abre direto.
+
+    A ORDEM importa: no PyMuPDF 1.28, ler `needs_pass` depois de autenticar
+    refaz a checagem com senha vazia e estraga a chave de decifragem -- as
+    paginas passam a sair vazias ("aes padding out of range"). Com
+    `is_encrypted` na frente, o `and` nunca chega a ele num documento ja
+    destrancado.
+    """
+    return bool(doc.is_encrypted) and bool(doc.needs_pass)
+
+
+# ----------------------------------------------------------- SENHAS LEMBRADAS
+# caminho normalizado -> senha. Evita ir ao banco (e ao DPAPI) a cada abertura:
+# o leitor reabre o arquivo em threads de busca, indice e exportacao.
+_SENHAS = {}
+_TRAVA_SENHAS = threading.Lock()
+
+
+def _chave_senha(caminho: str) -> str:
+    return os.path.normcase(os.path.abspath(str(caminho)))
+
+
+def lembrar_senha(caminho: str, senha: str):
+    """Guarda a senha so na memoria desta sessao (o banco e com o chamador)."""
+    with _TRAVA_SENHAS:
+        _SENHAS[_chave_senha(caminho)] = senha
+
+
+def _senha_guardada(caminho: str):
+    chave = _chave_senha(caminho)
+    with _TRAVA_SENHAS:
+        if chave in _SENHAS:
+            return _SENHAS[chave]
+    # Busca pela identidade do CONTEUDO, nao pelo caminho: o livro movido de
+    # pasta continua abrindo, e a senha pode ser gravada antes de a linha do
+    # livro existir na estante. Import tardio: o servico nao depende do banco
+    # para nada alem disso (os testes do motor o usam sem banco nenhum).
+    try:
+        from database.biblioteca import BancoBiblioteca
+        senha = BancoBiblioteca().obter_senha(PDFService.gerar_id_unico(caminho))
+    except Exception as erro:
+        print(f"[PDFService] Senha guardada indisponivel: {erro}")
+        senha = None
+    if senha:
+        lembrar_senha(caminho, senha)
+    return senha
 
 # Titulos que geradores de PDF gravam sozinhos e nao dizem nada sobre o livro.
 # Sem esta lista a estante exibe coisas como "PDF Content" no lugar do nome.
@@ -121,9 +187,10 @@ class PDFService:
     # ------------------------------------------------------------------ abrir
     @staticmethod
     def abrir_documento(caminho_pdf: str):
+        """Documento pronto para ler, ou None. Protegido abre com a senha lembrada."""
         try:
             doc = abrir(caminho_pdf)
-            if doc.needs_pass:
+            if bloqueado(doc):
                 doc.close()
                 return None
             return doc
@@ -133,11 +200,42 @@ class PDFService:
 
     @staticmethod
     def esta_protegido(caminho_pdf: str) -> bool:
+        """O arquivo tem senha de abertura (lembrada ou nao)."""
+        # EPUB nao tem senha no MuPDF; abrir um so para perguntar custaria a
+        # paginacao inteira do livro.
+        if not str(caminho_pdf).lower().endswith(".pdf"):
+            return False
         try:
-            with abrir(caminho_pdf) as doc:
-                return bool(doc.needs_pass)
+            with abrir(caminho_pdf, usar_guardada=False) as doc:
+                return bloqueado(doc)
         except Exception:
             return False
+
+    @staticmethod
+    def precisa_senha(caminho_pdf: str) -> bool:
+        """Protegido E sem senha lembrada que funcione: hora de perguntar."""
+        if not str(caminho_pdf).lower().endswith(".pdf"):
+            return False
+        try:
+            with abrir(caminho_pdf) as doc:
+                return bloqueado(doc)
+        except Exception:
+            return False
+
+    @staticmethod
+    def testar_senha(caminho_pdf: str, senha: str) -> bool:
+        """A senha destranca o arquivo? Ignora qualquer senha ja lembrada."""
+        if not senha:
+            return False
+        try:
+            with abrir(caminho_pdf, senha=senha, usar_guardada=False) as doc:
+                return not bloqueado(doc)
+        except Exception:
+            return False
+
+    @staticmethod
+    def lembrar_senha(caminho_pdf: str, senha: str):
+        lembrar_senha(caminho_pdf, senha)
 
     # ------------------------------------------------------------ busca global
     @staticmethod

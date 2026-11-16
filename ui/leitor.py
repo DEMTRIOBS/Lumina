@@ -46,6 +46,8 @@ import services.indice as indice_livro
 import services.exportar as exportar
 import services.realce as realce
 import services.tela as tela
+import services.dicionario as dicionario
+import services.vscode as vscode
 import services.voz as voz
 from services.pdf_service import abrir as abrir_livro
 from services.reflow import Bloco, MotorReflow
@@ -68,6 +70,7 @@ MINIMO_PALPITE = 0.28
 
 # Acao que usa o indice do livro em vez de mandar a pagina inteira ao modelo.
 ACAO_CONVERSAR = "Conversar com o livro"
+ACAO_CODIGO = "Relacionar com meu codigo (VS Code)"
 
 # Como cada origem de resultado se apresenta na lista da busca. O rotulo
 # importa: quem digitou uma palavra exata precisa saber quando um resultado
@@ -190,12 +193,19 @@ class TelaLeitor(ctk.CTkFrame):
         self._ultima_folha = 0.0
         self._limite_visto = False
         self._grade_folhas = []
+        self._regioes = []
+        self._trecho = []
+        self._agendado_recentrar = None
+        self._agendado_topo = None
         self._altura_da_grade = None
         self._folga_folha = 0
         self._folha_atual = 0
         self._simulando = False
         self._agendado_folha = None
         self._mascara = None
+        self._animacao = None
+        self._par = None
+        self._mascara_par = None
         self._entrar_pelo_fim = False
         self._estado_setas = None
         self._rolagem_ativa = False
@@ -290,14 +300,16 @@ class TelaLeitor(ctk.CTkFrame):
                                     "Assistente de estudo (Ctrl+I)")
         self.btn_tipografia = C.botao_icone(direita, "Aa", self.alternar_tipografia,
                                             "Aparencia e tipografia (Ctrl+P)")
+        self.btn_revisao = C.botao_icone(direita, "recentes", self.abrir_revisao,
+                                         "Revisar grifos e ver estatisticas (Ctrl+R)")
         self.btn_topo = C.botao_icone(direita, "fixar", self.alternar_sempre_no_topo,
                                       "Manter sobre outras janelas (Ctrl+T)")
         self.btn_foco = C.botao_icone(direita, "foco", self.alternar_modo_foco,
                                       "Modo foco (F11)")
 
         for widget in (self.btn_painel, self.btn_busca, self.btn_favorito, self.btn_nota,
-                       self.btn_voz, self.btn_ia, self.btn_tipografia, self.btn_topo,
-                       self.btn_foco):
+                       self.btn_voz, self.btn_ia, self.btn_revisao, self.btn_tipografia,
+                       self.btn_topo, self.btn_foco):
             widget.pack(side="left", padx=1)
 
     # ----------------------------------------------------------- barra busca
@@ -473,7 +485,7 @@ class TelaLeitor(ctk.CTkFrame):
 
         self.combo_acao = C.seletor(
             self.painel_ia,
-            [ACAO_CONVERSAR, "Resumo da pagina", "Palavras-chave",
+            [ACAO_CONVERSAR, ACAO_CODIGO, "Resumo da pagina", "Palavras-chave",
              "Gerar flashcards", "Explicar de forma simples",
              "Responder pergunta"],
             comando=self._ao_trocar_acao_ia, largura=250,
@@ -561,6 +573,7 @@ class TelaLeitor(ctk.CTkFrame):
             ("copiar", self.copiar_selecao, "Copiar (Ctrl+C)"),
             ("nota", self.abrir_notas, "Anotar esta pagina (Ctrl+N)"),
             ("ia", self.perguntar_sobre_selecao, "Enviar selecao ao assistente"),
+            ("info", self.consultar_dicionario, "Definir e traduzir a selecao"),
         ):
             C.botao_icone(self.barra_selecao, icone, comando, dica, tamanho=32).pack(
                 side="left", padx=2, pady=3)
@@ -591,6 +604,7 @@ class TelaLeitor(ctk.CTkFrame):
         self.id_livro = id_livro
         self.livro = livro
         self.documento = documento
+        MotorReflow.ocr_ativo = self.cfg.obter_bool("ocr_ativo", True)
         self.motor = MotorReflow(documento)
         self.prefs_livro = self.banco.obter_preferencias(id_livro)
         self.extras = {}
@@ -814,20 +828,24 @@ class TelaLeitor(ctk.CTkFrame):
         """
         if not self.documento or self.motor is None:
             return
-        posicao = 0.0
-        if manter_rolagem:
+        # Posicao a preservar: (pagina, caractere no topo, pixels de recuo da
+        # linha). Fracao do yview nao serve -- o trecho muda de tamanho.
+        ancora = self._posicao_no_topo() if manter_rolagem and self._regioes else None
+        if self._agendado_recentrar is not None:
             try:
-                posicao = self.txt.yview()[0]
+                self.after_cancel(self._agendado_recentrar)
             except Exception:
-                posicao = 0.0
+                pass
+            self._agendado_recentrar = None
 
         preset_atual = self.preset
         if preset_atual.get("pagina_como_imagem"):
+            self._regioes = []
             self._renderizar_pagina_inteira()
             return
 
-        pagina = self.motor.pagina(self.pagina_atual)
-        self.blocos_render = pagina.blocos
+        paginas = self._paginas_do_trecho()
+        self.blocos_render = self.motor.pagina(self.pagina_atual).blocos
 
         familia = FONTES_LEITURA.get(self.pref("fonte_leitura"), "Georgia")
         tamanho = max(9, self.pref_int("tamanho_fonte", TAMANHO_FONTE_PADRAO))
@@ -854,131 +872,165 @@ class TelaLeitor(ctk.CTkFrame):
         agrupa_artigos = bool(self.perfil_detectado and
                               (self.perfil_detectado.estrutura.get('artigos') or 0) >= 12)
         deslocamento = 0
+        regioes = []
+        ultimo_texto = None     # (bloco, inicio no texto) do ultimo bloco de texto
 
-        for bloco in pagina.blocos:
-            if bloco.tipo == "imagem":
-                if not mostrar_imagens:
-                    continue
-                partes.append("\n" + MARCA_IMAGEM + "\n\n")
-                imagens.append((deslocamento + 1, bloco))
-                marcacoes.append((deslocamento, deslocamento + 4, "centro"))
-                deslocamento += 4
-                continue
+        for numero in paginas:
+            pagina = self.motor.pagina(numero)
+            inicio_pagina = deslocamento
+            primeiro_da_pagina = True
+            for bloco in pagina.blocos:
+              # ---- costura: paragrafo que atravessa a quebra de pagina
+              # O PDF (e o EPUB paginado) corta o paragrafo onde a folha acaba:
+              # "...personalidade ou in" | "teligencia, e todo mundo...". Sem
+              # costura, a continuacao virava paragrafo novo, com recuo -- e a
+              # palavra partida ficava em dois pedacos.
+              if (primeiro_da_pagina and numero != paginas[0] and ultimo_texto
+                      and bloco.texto and self._continua_paragrafo(ultimo_texto[0], bloco)):
+                  fim_ant = partes[-1]
+                  if ultimo_texto[0].hifen_final:
+                      corte = 2 if fim_ant.endswith("-\n") else 1
+                      partes[-1] = fim_ant[:-corte]
+                      deslocamento -= corte
+                  else:
+                      partes[-1] = fim_ant[:-1] + " "
+                  if deslocamento < inicio_pagina:
+                      inicio_pagina = deslocamento
+              if bloco.tipo == "imagem" or bloco.texto:
+                  primeiro_da_pagina = False
+              if bloco.tipo == "imagem":
+                  if not mostrar_imagens:
+                      continue
+                  partes.append("\n" + MARCA_IMAGEM + "\n\n")
+                  imagens.append((deslocamento + 1, bloco))
+                  marcacoes.append((deslocamento, deslocamento + 4, "centro"))
+                  deslocamento += 4
+                  ultimo_texto = None
+                  continue
 
-            texto = bloco.texto
-            if not texto:
-                continue
-            if (preset.get("destacar_avisos") and bloco.tipo == "paragrafo"
-                    and _RE_AVISO.match(texto)):
-                bloco_tipo = "aviso_caixa"
-            else:
-                bloco_tipo = bloco.tipo
+              texto = bloco.texto
+              if not texto:
+                  continue
+              if (preset.get("destacar_avisos") and bloco.tipo == "paragrafo"
+                      and _RE_AVISO.match(texto)):
+                  bloco_tipo = "aviso_caixa"
+              else:
+                  bloco_tipo = bloco.tipo
 
-            tag = {
-                "titulo": f"titulo{max(1, min(3, bloco.nivel))}",
-                "aviso_caixa": "aviso_caixa",
-                "lista": "lista",
-                "citacao": "citacao",
-                "nota": "nota",
-                "codigo": "codigo",
-                "legenda": "legenda",
-                "aviso": "aviso",
-            }.get(bloco_tipo, "paragrafo")
+              tag = {
+                  "titulo": f"titulo{max(1, min(3, bloco.nivel))}",
+                  "aviso_caixa": "aviso_caixa",
+                  "lista": "lista",
+                  "citacao": "citacao",
+                  "nota": "nota",
+                  "codigo": "codigo",
+                  "legenda": "legenda",
+                  "aviso": "aviso",
+              }.get(bloco_tipo, "paragrafo")
 
-            # ---- artigo juridico: cabeca recolhivel com o corpo dentro
-            if agrupa_artigos:
-                cabeca = juridico.artigos(texto[:60])
-                eh_cabeca = bool(cabeca) and cabeca[0]["tipo"] == "artigo" \
-                    and cabeca[0]["inicio"] <= 2
-                if eh_cabeca:
-                    artigo_atual = len(faixas_artigo)
-                    faixas_artigo.append({
-                        "rotulo": cabeca[0]["rotulo"], "offset": deslocamento,
-                        "indice": artigo_atual,
-                        "dobrado": (self.pagina_atual, artigo_atual)
-                                   in self._artigo_dobrado,
-                    })
-                elif artigo_atual is not None and \
-                        faixas_artigo[artigo_atual]["dobrado"]:
-                    # Corpo de um artigo recolhido: some da pagina.
-                    continue
+              # ---- artigo juridico: cabeca recolhivel com o corpo dentro
+              if agrupa_artigos:
+                  cabeca = juridico.artigos(texto[:60])
+                  eh_cabeca = bool(cabeca) and cabeca[0]["tipo"] == "artigo" \
+                      and cabeca[0]["inicio"] <= 2
+                  if eh_cabeca:
+                      # Indice POR PAGINA: e a chave do "recolhido", e precisa
+                      # sobreviver ao trecho ser remontado a partir de outra pagina.
+                      chave = (numero, sum(1 for a in faixas_artigo if a["pagina"] == numero))
+                      artigo_atual = len(faixas_artigo)
+                      faixas_artigo.append({
+                          "rotulo": cabeca[0]["rotulo"], "offset": deslocamento,
+                          "indice": chave, "pagina": numero,
+                          "dobrado": chave in self._artigo_dobrado,
+                      })
+                  elif artigo_atual is not None and \
+                          faixas_artigo[artigo_atual]["dobrado"]:
+                      # Corpo de um artigo recolhido: some da pagina.
+                      continue
 
-            if bloco.tipo == "codigo":
-                indice_bloco = len(faixas_codigo)
-                lingua = realce.detectar(texto, self.motor.linguagem_dominante)
-                dobrado = (self.pagina_atual, indice_bloco) in self._codigo_dobrado
+              if bloco.tipo == "codigo":
+                  indice_bloco = sum(1 for f in faixas_codigo if f["pagina"] == numero)
+                  lingua = realce.detectar(texto, self.motor.linguagem_dominante)
+                  dobrado = (numero, indice_bloco) in self._codigo_dobrado
 
-                # Cabecalho do bloco, como num editor: nome da linguagem a
-                # esquerda; os botoes de copiar e dobrar sao ancorados nele.
-                cabecalho = f"  {realce.nome_exibicao(lingua).upper()}\n"
-                partes.append(cabecalho)
-                marcacoes.append((deslocamento, deslocamento + len(cabecalho),
-                                  "cod_cabecalho"))
-                inicio_cabecalho = deslocamento
-                deslocamento += len(cabecalho)
+                  # Cabecalho do bloco, como num editor: nome da linguagem a
+                  # esquerda; os botoes de copiar e dobrar sao ancorados nele.
+                  cabecalho = f"  {realce.nome_exibicao(lingua).upper()}\n"
+                  partes.append(cabecalho)
+                  marcacoes.append((deslocamento, deslocamento + len(cabecalho),
+                                    "cod_cabecalho"))
+                  inicio_cabecalho = deslocamento
+                  deslocamento += len(cabecalho)
 
-                corpo = texto
-                if dobrado:
-                    linhas_totais = corpo.count("\n") + 1
-                    corpo = (corpo.split("\n")[0].rstrip()
-                             + f"   ⋯ ({linhas_totais} linhas)")
-                elif numerar_codigo:
-                    corpo, faixas_num = codigo_util.numerar(texto)
+                  corpo = texto
+                  if dobrado:
+                      linhas_totais = corpo.count("\n") + 1
+                      corpo = (corpo.split("\n")[0].rstrip()
+                               + f"   ⋯ ({linhas_totais} linhas)")
+                  elif numerar_codigo:
+                      corpo, faixas_num = codigo_util.numerar(texto)
 
-                trecho = corpo + "\n"
-                partes.append(trecho)
-                marcacoes.append((deslocamento, deslocamento + len(trecho), tag))
-                ultima_linha = corpo.rfind("\n") + 1
-                marcacoes.append((deslocamento + ultima_linha,
-                                  deslocamento + len(trecho), "cod_fim"))
+                  trecho = corpo + "\n"
+                  partes.append(trecho)
+                  marcacoes.append((deslocamento, deslocamento + len(trecho), tag))
+                  ultima_linha = corpo.rfind("\n") + 1
+                  marcacoes.append((deslocamento + ultima_linha,
+                                    deslocamento + len(trecho), "cod_fim"))
 
-                if not dobrado:
-                    if numerar_codigo:
-                        for ini, fim in faixas_num:
-                            marcacoes.append((deslocamento + ini, deslocamento + fim,
-                                              "cod_numero_linha"))
-                        mapa = codigo_util.mapear(texto)
-                    else:
-                        mapa = None
-                    # A linguagem dominante do livro socorre trechos curtos
-                    # demais para se identificarem sozinhos.
-                    for ini, fim, classe in realce.tokenizar(
-                            texto, lingua=lingua,
-                            dominante=self.motor.linguagem_dominante):
-                        if mapa is not None:
-                            ini, fim = mapa[ini], mapa[min(fim, len(mapa) - 1)]
-                        marcacoes.append((deslocamento + ini, deslocamento + fim,
-                                          f"cod_{classe}"))
+                  if not dobrado:
+                      if numerar_codigo:
+                          for ini, fim in faixas_num:
+                              marcacoes.append((deslocamento + ini, deslocamento + fim,
+                                                "cod_numero_linha"))
+                          mapa = codigo_util.mapear(texto)
+                      else:
+                          mapa = None
+                      # A linguagem dominante do livro socorre trechos curtos
+                      # demais para se identificarem sozinhos.
+                      for ini, fim, classe in realce.tokenizar(
+                              texto, lingua=lingua,
+                              dominante=self.motor.linguagem_dominante):
+                          if mapa is not None:
+                              ini, fim = mapa[ini], mapa[min(fim, len(mapa) - 1)]
+                          marcacoes.append((deslocamento + ini, deslocamento + fim,
+                                            f"cod_{classe}"))
 
-                faixas_codigo.append({
-                    "cabecalho": inicio_cabecalho, "texto": texto,
-                    "lingua": lingua, "indice": indice_bloco, "dobrado": dobrado,
-                    "dobravel": bool(codigo_util.regioes_dobraveis(texto))
-                                 or texto.count("\n") >= 4,
-                    # Faixa do bloco inteiro, cabecalho incluso: e o que
-                    # permite saber se o ponteiro esta em cima DESTE trecho.
-                    "inicio": inicio_cabecalho,
-                    "fim": deslocamento + len(trecho),
-                })
-                deslocamento += len(trecho)
-                continue
+                  faixas_codigo.append({
+                      "cabecalho": inicio_cabecalho, "texto": texto,
+                      "lingua": lingua, "indice": (numero, indice_bloco),
+                      "pagina": numero, "dobrado": dobrado,
+                      "dobravel": bool(codigo_util.regioes_dobraveis(texto))
+                                   or texto.count("\n") >= 4,
+                      # Faixa do bloco inteiro, cabecalho incluso: e o que
+                      # permite saber se o ponteiro esta em cima DESTE trecho.
+                      "inicio": inicio_cabecalho,
+                      "fim": deslocamento + len(trecho),
+                  })
+                  deslocamento += len(trecho)
+                  ultimo_texto = None
+                  continue
 
-            trecho = texto + "\n"
-            partes.append(trecho)
-            marcacoes.append((deslocamento, deslocamento + len(trecho), tag))
+              trecho = texto + "\n"
+              partes.append(trecho)
+              marcacoes.append((deslocamento, deslocamento + len(trecho), tag))
 
-            if usa_mono:
-                # Mencoes a codigo no meio da prosa ("use o list_display").
-                for inicio, fim in bloco.mono:
-                    marcacoes.append((deslocamento + inicio, deslocamento + fim,
-                                      "mono_inline"))
+              if usa_mono:
+                  # Mencoes a codigo no meio da prosa ("use o list_display").
+                  for inicio, fim in bloco.mono:
+                      marcacoes.append((deslocamento + inicio, deslocamento + fim,
+                                        "mono_inline"))
 
-            deslocamento += len(trecho)
+              deslocamento += len(trecho)
+              ultimo_texto = (bloco,)
+            regioes.append((numero, inicio_pagina, deslocamento))
 
         conteudo = "".join(partes)
         if not conteudo.strip():
             conteudo = "\nEsta pagina nao contem texto extraivel.\n"
             marcacoes = [(0, len(conteudo), "aviso")]
+            regioes = [(self.pagina_atual, 0, len(conteudo))]
+        self._regioes = regioes
+        self._trecho = paginas
 
         self.imagens_render.clear()
         self._dados_img.clear()
@@ -1011,22 +1063,16 @@ class TelaLeitor(ctk.CTkFrame):
             except Exception as erro:
                 print(f"[Leitor] Justificacao falhou: {erro}")
         self.area.configure(state="disabled")
-        if posicao:
-            self.update_idletasks()
-        self.txt.yview_moveto(posicao)
         self._acumulado_wheel = 0
         self._grade_folhas = []
-        if self._em_folha():
-            entrada = "fim" if self._entrar_pelo_fim else (
-                self.txt.index("@0,4") if posicao else None)
-            self._entrar_pelo_fim = False
-            self._montar_folhas(manter_indice=entrada)
-        elif self._entrar_pelo_fim:
-            # `see` mede de verdade; yview_moveto(1.0) usa a ALTURA ESTIMADA
-            # da pagina e as vezes parava a dois tercos dela.
-            self._entrar_pelo_fim = False
-            self.update_idletasks()
-            self.txt.see("end-1c")
+        pelo_fim = self._entrar_pelo_fim
+        self._entrar_pelo_fim = False
+        if ancora and self._regiao(ancora[0]):
+            self._posicionar(self._regiao(ancora[0])[1] + ancora[1], ancora[2])
+        elif pelo_fim:
+            self._mostrar_fim_da_pagina(self.pagina_atual)
+        else:
+            self._posicionar(self._regiao(self.pagina_atual)[1])
 
         self._atualizar_rodape()
         self._atualizar_estado_botoes()
@@ -1263,7 +1309,10 @@ class TelaLeitor(ctk.CTkFrame):
         respiro_bloco = max(8, int(em * 0.9))
         self.txt.tag_configure("codigo", font=("Consolas", max(8, int(tamanho * 0.82))),
                                spacing1=1, spacing2=1, spacing3=1,
-                               lmargin1=margem_lista, lmargin2=margem_lista + 14,
+                               # Linha longa quebra com recuo de ~4 colunas: le-se
+                               # como continuacao, como no word wrap dos editores.
+                               lmargin1=margem_lista,
+                               lmargin2=margem_lista + max(14, int(tamanho * 1.9)),
                                rmargin=ESP["sm"], background=T.superficie_alt,
                                foreground=T.texto)
         self.txt.tag_configure("cod_fim", spacing3=max(8, int(em * 0.6)))
@@ -1572,7 +1621,10 @@ class TelaLeitor(ctk.CTkFrame):
             vaos = len(linha) - 1
             # Linha frouxa demais (palavra longa empurrada para baixo): melhor
             # deixar a esquerda que abrir buracos no meio da frase.
-            if sobra / vaos > espaco * 4:
+            # Ate ~5 espacos por vao ainda le bem; acima disso o buraco
+            # incomoda mais que a margem irregular. Em coluna estreita (meia
+            # tela) o limite antigo, 4, deixava linha demais sem justificar.
+            if sobra / vaos > espaco * 5.5:
                 continue
             base = 0 if indice_linha == 0 else linha[0][0]
             # As paradas de tab do Tk contam da borda da coluna, nao do recuo
@@ -1728,7 +1780,22 @@ class TelaLeitor(ctk.CTkFrame):
         self._entrada_quadro = None
         if salvar:
             self.banco.definir_pagina(self.id_livro, numero)
-        self.renderizar()
+        if self._usa_trecho() and self._regiao(numero) and self._trecho:
+            # Ja esta montada no trecho: basta rolar ate ela.
+            pelo_fim = self._entrar_pelo_fim
+            self._entrar_pelo_fim = False
+            if pelo_fim:
+                self._mostrar_fim_da_pagina(numero)
+            else:
+                self._posicionar(self._regiao(numero)[1])
+            self.blocos_render = self.motor.pagina(numero).blocos
+            self._atualizar_rodape()
+            self._atualizar_estado_botoes()
+            if self.painel_aberto in ("Sumario", "Marcadores", "Notas"):
+                self._preencher_painel(self.painel_aberto)
+            self.after(120, self._verificar_pagina_no_topo)
+        else:
+            self.renderizar()
         self._retomar_cronometro()
 
     def proxima_pagina(self, _=None):
@@ -1781,8 +1848,10 @@ class TelaLeitor(ctk.CTkFrame):
         """Reconfigura os controles quando o modo muda."""
         modo = self.modo_virada
         self._mostrar_barra_rolagem(modo != MODO_FOLHA)
+        if self._atualizar_duas_folhas() and self.documento:
+            self.after_idle(lambda: self.renderizar(manter_rolagem=True))
         if modo == MODO_FOLHA:
-            self.after_idle(self._montar_folhas)
+            self.after_idle(self._folhear_daqui)
         else:
             self._esconder_mascara()
             self._remover_folga_final()
@@ -1798,6 +1867,168 @@ class TelaLeitor(ctk.CTkFrame):
         self._estado_setas = None
         self._atualizar_setas()
         self.txt.configure(cursor="arrow")
+
+    # ============================================================ TRECHO
+    # Nos modos de leitura corrida (Rolagem continua, Folhear, Automatica) a
+    # tela mostra um TRECHO de paginas seguidas, nao uma pagina so: o texto
+    # flui de uma para a outra sem buraco no fim de cada pagina e sem a
+    # palavra partida entre elas. Cada pagina continua com a sua REGIAO no
+    # texto -- grifos, notas e progresso seguem amarrados a pagina, com os
+    # mesmos offsets de antes. A "pagina atual" passa a ser a que esta no
+    # topo da tela; perto da borda do trecho, ele e remontado em volta dela.
+    _PAGINAS_ANTES = 1
+    _PAGINAS_DEPOIS = 3
+
+    def _folha_na_pagina(self):
+        """(folha atual, total de folhas) DENTRO da pagina atual.
+
+        A grade cobre o trecho inteiro; o leitor quer saber da pagina dele.
+        Uma folha que comeca no fim da pagina anterior e termina nesta conta
+        como a primeira desta.
+        """
+        grade = self._grade_folhas
+        regiao = self._regiao(self.pagina_atual)
+        if not grade or not regiao:
+            return None
+        _n, inicio, fim = regiao
+        primeira = max((i for i, s in enumerate(grade) if s <= inicio), default=0)
+        ultima = max((i for i, s in enumerate(grade) if s < fim), default=primeira)
+        total = max(1, ultima - primeira + 1)
+        atual = min(total, max(1, self._folha_atual - primeira + 1))
+        return atual, total
+
+    def _usa_trecho(self):
+        return (self.modo_virada in (MODO_LIVRE, MODO_FOLHA, MODO_AUTO)
+                and not self.preset.get("pagina_como_imagem")
+                and not self.quadro_a_quadro)
+
+    def _paginas_do_trecho(self):
+        p = self.pagina_atual
+        if not self._usa_trecho():
+            return [p]
+        inicio = max(0, p - self._PAGINAS_ANTES)
+        fim = min(self.total_paginas - 1, p + self._PAGINAS_DEPOIS)
+        return list(range(inicio, fim + 1))
+
+    @staticmethod
+    def _continua_paragrafo(anterior, bloco):
+        """O primeiro bloco da pagina continua o ultimo da pagina anterior?"""
+        if anterior.tipo not in ("paragrafo", "citacao") or bloco.tipo != anterior.tipo:
+            return False
+        texto = bloco.texto.lstrip()
+        if not texto:
+            return False
+        if anterior.hifen_final:
+            return texto[:1].islower()
+        final = anterior.texto.rstrip()[-1:]
+        return texto[:1].islower() and final not in ".!?:;\"'”»)"
+
+    def _regiao(self, numero):
+        for regiao in self._regioes:
+            if regiao[0] == numero:
+                return regiao
+        return None
+
+    def _pagina_do_offset(self, offset):
+        """(pagina, inicio da regiao) que contem o offset global."""
+        escolhida = self._regioes[0] if self._regioes else (self.pagina_atual, 0, 0)
+        for regiao in self._regioes:
+            if regiao[1] <= offset:
+                escolhida = regiao
+            else:
+                break
+        return escolhida[0], escolhida[1]
+
+    def _posicao_no_topo(self):
+        """(pagina, offset local, recuo em pixels) da linha no topo da tela."""
+        topo, _base = self._limites_visiveis()
+        indice = self.txt.index(f"@0,{topo + 1}")
+        offset = self._para_offset(self.txt.index(f"{indice} display linestart"))
+        info = self.txt.dlineinfo(indice)
+        recuo = max(0, topo - info[1]) if info else 0
+        pagina, inicio = self._pagina_do_offset(offset)
+        return pagina, offset - inicio, recuo
+
+    def _posicionar(self, offset, recuo=0):
+        """Poe o caractere `offset` no topo da tela (folha comecando nele)."""
+        if self._em_folha():
+            self._montar_folhas(ancora=offset)
+            return
+        self.update_idletasks()
+        self.txt.yview(f"1.0+{int(offset)}c")
+        if recuo:
+            self.txt.yview_scroll(int(recuo), "pixels")
+
+    def _mostrar_fim_da_pagina(self, numero):
+        regiao = self._regiao(numero)
+        if not regiao:
+            return
+        ultimo = f"1.0+{max(regiao[1], regiao[2] - 2)}c"
+        if self._em_folha():
+            self._montar_folhas(manter_indice=ultimo)
+            return
+        # `see` mede de verdade; yview_moveto(1.0) usa a ALTURA ESTIMADA e as
+        # vezes parava a dois tercos da pagina.
+        self.update_idletasks()
+        self.txt.see(ultimo)
+
+    def _pode_estender(self, direcao):
+        if not self._usa_trecho() or len(self._trecho) < 1:
+            return False
+        if direcao > 0:
+            return self._trecho[-1] < self.total_paginas - 1
+        return self._trecho[0] > 0
+
+    def _recentrar(self):
+        """Remonta o trecho em volta da pagina do topo, sem mexer na leitura."""
+        self._agendado_recentrar = None
+        if not self.documento or not self._usa_trecho():
+            return
+        self._verificar_pagina_no_topo(recentrar=False)
+        self.renderizar(manter_rolagem=True)
+
+    def _agendar_recentrar(self):
+        # Nao reinicia o relogio a cada evento: na rolagem automatica a tela
+        # nunca para, e um temporizador sempre adiado nunca dispararia.
+        if self._agendado_recentrar is None:
+            self._agendado_recentrar = self.after(450, self._recentrar)
+
+    def _agendar_verificar_topo(self):
+        if self._agendado_topo is None:
+            self._agendado_topo = self.after(90, self._verificar_pagina_no_topo)
+
+    def _verificar_pagina_no_topo(self, recentrar=True):
+        """A pagina do topo da tela mudou? Ela vira a pagina atual."""
+        self._agendado_topo = None
+        if (not self.documento or len(self._trecho) < 2 or self._simulando
+                or not self._regioes):
+            return
+        try:
+            # Pelo FIM da primeira linha visivel: quando a pagina comeca no
+            # meio de uma linha costurada ("...ou in|teligencia"), o inicio
+            # dessa linha ainda e da pagina anterior.
+            topo, _base = self._limites_visiveis()
+            fim_linha = self.txt.index(f"@0,{topo + 1} display lineend")
+            numero = self._pagina_do_offset(self._para_offset(fim_linha))[0]
+        except Exception:
+            return
+        if numero != self.pagina_atual:
+            self._pausar_cronometro()
+            self.pagina_atual = numero
+            self.blocos_render = self.motor.pagina(numero).blocos
+            self.banco.definir_pagina(self.id_livro, numero)
+            self._retomar_cronometro()
+            self._atualizar_rodape()
+            self._atualizar_estado_botoes()
+            if self.painel_aberto in ("Sumario", "Marcadores", "Notas"):
+                self._preencher_painel(self.painel_aberto)
+        if not recentrar:
+            return
+        posicao = self._trecho.index(numero) if numero in self._trecho else -1
+        perto_do_fim = posicao >= len(self._trecho) - 2 and self._pode_estender(1)
+        perto_do_inicio = posicao == 0 and self._pode_estender(-1)
+        if perto_do_fim or perto_do_inicio:
+            self._agendar_recentrar()
 
     # ========================================================== FOLHEAR
     # O texto cabe na tela e vira por folhas, como num livro. A pagina do PDF
@@ -1933,11 +2164,15 @@ class TelaLeitor(ctk.CTkFrame):
             inicio = anterior
         return inicio
 
-    def _montar_folhas(self, manter_indice=None):
-        """Calcula a grade de folhas da pagina e mostra a folha certa.
+    def _montar_folhas(self, manter_indice=None, ancora=None):
+        """Calcula a grade de folhas do trecho e mostra a folha certa.
 
-        `manter_indice`: indice de texto que deve continuar visivel (retomada
-        de leitura, resultado de busca, redimensionamento) ou "fim".
+        `manter_indice`: indice de texto que deve continuar visivel (busca,
+        selecao arrastada) ou "fim" -- mostra a folha que o CONTEM.
+        `ancora`: offset que vira o INICIO exato de uma folha. E o que mantem
+        a leitura parada no lugar quando o trecho e remontado (recentrar,
+        redimensionar, trocar fonte): a grade se reorganiza em volta da frase
+        do topo, em vez de a frase pular para o meio de outra folha.
         """
         self._grade_folhas = []
         if not self._em_folha():
@@ -1951,35 +2186,57 @@ class TelaLeitor(ctk.CTkFrame):
                 manter = None
         self._simulando = True
         try:
-            self.txt.yview("1.0")
-            self.txt.update_idletasks()
-            grade = [0]
-            for _ in range(400):
-                if self._fim_visivel():
-                    break
-                proxima = self._inicio_da_proxima_folha()
-                offset = self._para_offset(proxima)
-                if offset <= grade[-1]:
-                    break
-                # So sobrou espaco em branco (a margem do ultimo paragrafo):
-                # uma folha vazia no fim seria uma virada inutil.
-                if (not self.txt.get(proxima, "end").strip()
-                        and not self.txt.dump(proxima, "end", image=True)):
-                    break
-                grade.append(offset)
-                self.txt.yview(proxima)
-                self.txt.update_idletasks()
+            if ancora is not None:
+                ancora = self._para_offset(
+                    self.txt.index(f"1.0+{int(ancora)}c display linestart"))
+                antes = [s for s in self._simular_folhas(0, parar_em=ancora) if s < ancora]
+                grade = antes + self._simular_folhas(ancora)
+                alvo = len(antes)
+            else:
+                grade = self._simular_folhas(0)
+                alvo = 0
+                if manter_indice == "fim":
+                    alvo = len(grade) - 1
+                elif manter is not None:
+                    alvo = max(i for i, inicio in enumerate(grade) if inicio <= manter)
             self._grade_folhas = grade
             self._altura_da_grade = self.txt.winfo_height()
         finally:
             self._simulando = False
-
-        alvo = 0
-        if manter_indice == "fim":
-            alvo = len(grade) - 1
-        elif manter is not None:
-            alvo = max(i for i, inicio in enumerate(grade) if inicio <= manter)
         self._mostrar_folha(alvo)
+
+    def _folhear_daqui(self):
+        """Monta as folhas a partir da linha que esta no topo agora."""
+        if not self._em_folha():
+            return
+        try:
+            self._montar_folhas(ancora=self._offset_no_topo())
+        except Exception:
+            self._montar_folhas()
+
+    def _simular_folhas(self, inicio, parar_em=None):
+        """Inicios de folha a partir de `inicio` ate o fim (ou ate `parar_em`)."""
+        self.txt.yview(f"1.0+{inicio}c")
+        self.txt.update_idletasks()
+        grade = [inicio]
+        for _ in range(600):
+            if parar_em is not None and grade[-1] >= parar_em:
+                break
+            if self._fim_visivel():
+                break
+            proxima = self._inicio_da_proxima_folha()
+            offset = self._para_offset(proxima)
+            if offset <= grade[-1]:
+                break
+            # So sobrou espaco em branco (a margem do ultimo paragrafo):
+            # uma folha vazia no fim seria uma virada inutil.
+            if (not self.txt.get(proxima, "end").strip()
+                    and not self.txt.dump(proxima, "end", image=True)):
+                break
+            grade.append(offset)
+            self.txt.yview(proxima)
+            self.txt.update_idletasks()
+        return grade
 
     def _aplicar_folga_final(self):
         """Espaco em branco depois do fim da pagina, do tamanho da tela.
@@ -2003,10 +2260,23 @@ class TelaLeitor(ctk.CTkFrame):
         except Exception:
             pass
 
-    def _mostrar_folha(self, indice):
+    def _mostrar_folha(self, indice, animar=False):
         grade = self._grade_folhas or [0]
         indice = max(0, min(indice, len(grade) - 1))
+        self._concluir_animacao()
+        anterior = self._folha_atual
         self._folha_atual = indice
+        if (animar and abs(indice - anterior) == 1 and 0 <= anterior < len(grade)
+                and not self._duas_folhas()
+                and self.cfg.obter_bool("animar_folha", True)):
+            if self._animar_ate(grade[anterior], grade[indice]):
+                return
+        self._fixar_folha()
+
+    def _fixar_folha(self):
+        """Encaixa a folha atual exatamente no topo (fim de qualquer animacao)."""
+        grade = self._grade_folhas or [0]
+        indice = max(0, min(self._folha_atual, len(grade) - 1))
         self._simulando = True
         try:
             self.txt.yview(f"1.0+{grade[indice]}c")
@@ -2014,24 +2284,230 @@ class TelaLeitor(ctk.CTkFrame):
         finally:
             self._simulando = False
         self._atualizar_mascara()
+        # O aviso de rolagem do Tk chega durante o encaixe (e e ignorado ali):
+        # a pagina do topo e conferida aqui, ao fim de cada virada.
+        if len(self._trecho) > 1:
+            self._verificar_pagina_no_topo()
         self._atualizar_rodape()
+        self._sincronizar_par()
+
+    # ---- duas folhas lado a lado
+    # Em janela larga o Folhear mostra duas folhas, como um livro aberto. A
+    # folha da direita e um PEER do Tk: outro visor do MESMO texto, com os
+    # mesmos grifos, busca e figuras -- nada e montado duas vezes. Ela so liga
+    # quando cabem duas colunas de leitura inteiras; em meia tela, uma folha.
+    _OPCOES_COPIADAS_DO_PAR = ("background", "foreground", "padx", "pady",
+                               "spacing1", "spacing2", "spacing3", "wrap", "font",
+                               "selectbackground", "selectforeground",
+                               "insertwidth", "cursor", "tabs")
+
+    def _quer_duas_folhas(self):
+        if not self._em_folha() or not self.cfg.obter_bool("duas_folhas", True):
+            return False
+        try:
+            largura = self.palco.winfo_width()
+        except Exception:
+            return False
+        familia = FONTES_LEITURA.get(self.pref("fonte_leitura"), "Georgia")
+        tamanho = max(9, self.pref_int("tamanho_fonte", TAMANHO_FONTE_PADRAO))
+        alvo = max(LARGURA_COLUNA_MIN,
+                   min(LARGURA_COLUNA_MAX, self.pref_int("largura_coluna", 68)))
+        coluna = alvo * self._largura_do_caractere(familia, tamanho)
+        return largura >= 2 * coluna + 4 * ESP["xl"]
+
+    def _duas_folhas(self):
+        return self._par is not None and self._par.winfo_ismapped()
+
+    def _atualizar_duas_folhas(self):
+        """Liga/desliga a segunda folha conforme o modo e a largura."""
+        quer = self._quer_duas_folhas()
+        if quer == self._duas_folhas():
+            return False
+        if quer:
+            if self._par is None:
+                # O tkinter nao embrulha um peer ja existente: registra-se o
+                # objeto Python e o Tk cria o widget com aquele nome.
+                par = tk.Text.__new__(tk.Text)
+                tk.BaseWidget._setup(par, self.palco, {})
+                par.widgetName = "text"
+                self.txt.tk.call(self.txt._w, "peer", "create", par._w)
+                # Sem a borda afundada padrao do Text: virava um risco claro
+                # entre as duas folhas.
+                par.configure(relief="flat", borderwidth=0, highlightthickness=0)
+                self._par = par
+                self._par.bind("<MouseWheel>", self._ao_rolar)
+                self._par.bind("<Button-1>", self._ao_clicar_par, add=True)
+                self._par.bind("<<Selection>>", self._ao_mudar_selecao, add=True)
+            self.palco.grid_columnconfigure(0, weight=1, uniform="folhas")
+            self.palco.grid_columnconfigure(1, weight=1, uniform="folhas")
+            self._par.grid(row=0, column=1, sticky="nsew")
+        else:
+            if self._par is not None:
+                self._par.grid_remove()
+            if self._mascara_par is not None:
+                self._mascara_par.place_forget()
+            self.palco.grid_columnconfigure(0, weight=1, uniform="")
+            self.palco.grid_columnconfigure(1, weight=0, uniform="")
+        return True
+
+    def _copiar_opcoes_para_par(self):
+        if self._par is None:
+            return
+        opcoes = {}
+        for nome in self._OPCOES_COPIADAS_DO_PAR:
+            try:
+                opcoes[nome] = self.txt.cget(nome)
+            except Exception:
+                pass
+        try:
+            self._par.configure(state="normal", **opcoes)
+            self._par.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _sincronizar_par(self):
+        """A folha da direita mostra a folha seguinte a da esquerda."""
+        if not self._duas_folhas():
+            return
+        self._copiar_opcoes_para_par()
+        grade = self._grade_folhas or [0]
+        seguinte = self._folha_atual + 1
+        if self._mascara_par is None:
+            self._mascara_par = tk.Frame(self.palco, bd=0, highlightthickness=0)
+            self._mascara_par.bind("<MouseWheel>", self._ao_rolar)
+            self._mascara_par.bind("<Button-1>", lambda e: self._virar_folha(1))
+        self._mascara_par.configure(bg=self.txt.cget("bg"))
+        dx = self._par.winfo_rootx() - self.palco.winfo_rootx()
+        dy = self._par.winfo_rooty() - self.palco.winfo_rooty()
+        if seguinte >= len(grade):
+            # Nao ha folha seguinte no trecho: a direita fica em branco.
+            self._mascara_par.place(x=dx, y=dy, width=self._par.winfo_width(),
+                                    height=self._par.winfo_height())
+            self._mascara_par.lift()
+            return
+        self._par.yview(f"1.0+{grade[seguinte]}c")
+        self._par.update_idletasks()
+        corte = None
+        if seguinte + 1 < len(grade):
+            info = self._par.dlineinfo(f"1.0+{grade[seguinte + 1]}c")
+            if info:
+                corte = info[1]
+        if corte is None:
+            self._mascara_par.place_forget()
+        else:
+            self._mascara_par.place(x=dx, y=dy + corte, width=self._par.winfo_width(),
+                                    height=self._par.winfo_height() - corte)
+            self._mascara_par.lift()
+
+    def _ao_clicar_par(self, evento):
+        largura = max(1, self._par.winfo_width())
+        if evento.x >= largura * 0.75:
+            self._virar_folha(1)
+            return "break"
+
+    # ---- deslize da virada
+    # A folha desliza em ~120 ms, desacelerando no fim (ease-out cubico):
+    # rapido o bastante para nunca atrapalhar quem vira varias seguidas, e o
+    # suficiente para o olho acompanhar para onde o texto foi. Uma nova virada
+    # no meio do deslize termina o anterior na hora.
+    _QUADROS_DESLIZE = 7
+
+    def _animar_ate(self, origem, destino):
+        try:
+            if destino >= origem:
+                distancia = self._ypx(f"1.0+{origem}c", f"1.0+{destino}c")
+            else:
+                distancia = -self._ypx(f"1.0+{destino}c", f"1.0+{origem}c")
+        except Exception:
+            return False
+        if not distancia or abs(distancia) > 4000:
+            return False
+        self._esconder_mascara()
+        self._simulando = True
+        passos = [round(distancia * (1 - (1 - k / self._QUADROS_DESLIZE) ** 3))
+                  for k in range(1, self._QUADROS_DESLIZE + 1)]
+        self._animacao = {"passos": passos, "feito": 0, "id": None}
+        self._quadro_deslize()
+        return True
+
+    def _quadro_deslize(self):
+        anim = self._animacao
+        if anim is None:
+            return
+        anim["id"] = None
+        if not anim["passos"]:
+            self._concluir_animacao()
+            return
+        alvo = anim["passos"].pop(0)
+        delta = alvo - anim["feito"]
+        anim["feito"] = alvo
+        if delta:
+            self.txt.yview_scroll(delta, "pixels")
+        if anim["passos"]:
+            anim["id"] = self.after(16, self._quadro_deslize)
+        else:
+            self._concluir_animacao()
+
+    def _concluir_animacao(self):
+        anim = getattr(self, "_animacao", None)
+        if anim is None:
+            return
+        self._animacao = None
+        if anim.get("id") is not None:
+            try:
+                self.after_cancel(anim["id"])
+            except Exception:
+                pass
+        self._simulando = False
+        self._fixar_folha()
 
     def _virar_folha(self, direcao):
         if not self._grade_folhas:
             self._montar_folhas(manter_indice=self.txt.index("@0,4"))
+        if self._duas_folhas():
+            self._virar_par_de_folhas(direcao)
+            return
         if direcao > 0:
             if self._folha_atual + 1 < len(self._grade_folhas):
-                self._mostrar_folha(self._folha_atual + 1)
+                self._mostrar_folha(self._folha_atual + 1, animar=True)
+            elif self._pode_estender(1):
+                # Fim do trecho montado: remonta em volta da folha atual e
+                # segue -- a costura continua, sem saltar para o topo da
+                # pagina seguinte.
+                self._recentrar()
+                if self._folha_atual + 1 < len(self._grade_folhas):
+                    self._mostrar_folha(self._folha_atual + 1)
             elif self.pagina_atual < self.total_paginas - 1:
                 self.proxima_pagina()
         else:
             if self._folha_atual > 0:
-                self._mostrar_folha(self._folha_atual - 1)
+                self._mostrar_folha(self._folha_atual - 1, animar=True)
+            elif self._pode_estender(-1):
+                self._recentrar()
+                if self._folha_atual > 0:
+                    self._mostrar_folha(self._folha_atual - 1)
             elif self.pagina_atual > 0:
                 # Voltar de pagina abre na ULTIMA folha da anterior: e a
                 # continuacao natural de quem esta folheando para tras.
                 self._entrar_pelo_fim = True
                 self.pagina_anterior()
+
+    def _virar_par_de_folhas(self, direcao):
+        """Com duas folhas na tela, cada virada avanca as duas."""
+        alvo = self._folha_atual + 2 * direcao
+        if direcao > 0 and alvo >= len(self._grade_folhas) and self._pode_estender(1):
+            self._recentrar()
+            alvo = self._folha_atual + 2
+        if direcao < 0 and alvo < 0 and self._pode_estender(-1):
+            self._recentrar()
+            alvo = self._folha_atual - 2
+        if 0 <= alvo < len(self._grade_folhas):
+            self._mostrar_folha(alvo)
+        elif direcao > 0 and self.pagina_atual < self.total_paginas - 1 \
+                and not self._pode_estender(1):
+            self._mostrar_folha(len(self._grade_folhas) - 1)
+        elif direcao < 0 and alvo < 0:
+            self._mostrar_folha(0)
 
     def _atualizar_mascara(self):
         if not self._em_folha():
@@ -2087,7 +2563,7 @@ class TelaLeitor(ctk.CTkFrame):
                         and grade[self._folha_atual] == no_topo
                         and self.txt.winfo_height() == self._altura_da_grade)
             if not alinhado:
-                self._montar_folhas(manter_indice=f"1.0+{no_topo}c")
+                self._montar_folhas(ancora=no_topo)
             else:
                 self._atualizar_mascara()
         except Exception:
@@ -2116,6 +2592,8 @@ class TelaLeitor(ctk.CTkFrame):
             self._limite_visto = no_limite
         if self._em_folha() and not self._simulando:
             self._agendar_realinhar_folha()
+        if len(self._trecho) > 1 and not self._simulando:
+            self._agendar_verificar_topo()
         # ...e reage a chegada ao fim/topo da pagina.
         try:
             self._atualizar_setas(float(primeiro), float(ultimo))
@@ -2227,6 +2705,9 @@ class TelaLeitor(ctk.CTkFrame):
         if time.time() - self._chegou_ao_limite < 0.3:
             return "break"
         self._acumulado_wheel = 0
+        if self._pode_estender(1 if descendo else -1):
+            self._recentrar()
+            return "break"
         if descendo:
             if self.pagina_atual < self.total_paginas - 1:
                 self.proxima_pagina()
@@ -2248,6 +2729,10 @@ class TelaLeitor(ctk.CTkFrame):
             return
         salto = int(self.txt.winfo_height() * 0.85)
 
+        if direcao > 0 and self._fim_visivel() and self._pode_estender(1):
+            self._recentrar()
+        elif direcao < 0 and self._inicio_visivel() and self._pode_estender(-1):
+            self._recentrar()
         if direcao > 0:
             if self._fim_visivel():
                 self.proxima_pagina()
@@ -2322,6 +2807,10 @@ class TelaLeitor(ctk.CTkFrame):
         self._id_rolagem = None
         if not self._rolagem_ativa:
             return
+        if self._pode_estender(1):
+            self._recentrar()
+            self._id_rolagem = self.after(INTERVALO_ROLAGEM_MS, self._tique_rolagem)
+            return
         if self.pagina_atual >= self.total_paginas - 1:
             self.parar_rolagem()
             C.Toast.mostrar(self, "Fim do livro.", "ok", 2000)
@@ -2392,8 +2881,12 @@ class TelaLeitor(ctk.CTkFrame):
         # Tk e estimada ate o layout terminar (0.32 na tela voltava 0.18) e
         # muda com a fonte; o offset aponta sempre para a mesma frase.
         try:
-            topo = self._para_offset(self.txt.index("@0,0"))
-            self.banco.definir_rolagem(self.id_livro, topo)
+            # Offset LOCAL da pagina do topo: num trecho de varias paginas o
+            # global nao significaria nada na proxima abertura.
+            self._verificar_pagina_no_topo(recentrar=False)
+            pagina, local, _recuo = self._posicao_no_topo()
+            if pagina == self.pagina_atual:
+                self.banco.definir_rolagem(self.id_livro, local)
         except Exception:
             pass
 
@@ -2401,10 +2894,8 @@ class TelaLeitor(ctk.CTkFrame):
         if id_livro != self.id_livro:
             return
         try:
-            self.update_idletasks()
-            self.txt.yview(f"1.0+{int(offset)}c")
-            if self._em_folha():
-                self._montar_folhas(manter_indice=f"1.0+{int(offset)}c")
+            regiao = self._regiao(self.pagina_atual)
+            self._posicionar((regiao[1] if regiao else 0) + int(offset))
         except Exception:
             pass
 
@@ -2466,6 +2957,7 @@ class TelaLeitor(ctk.CTkFrame):
             "<Control-n>": lambda e: self.abrir_notas(),
             "<Control-d>": lambda e: self.alternar_favorito(),
             "<Control-g>": lambda e: self.pedir_pagina(),
+            "<Control-r>": lambda e: self.abrir_revisao(),
             "<Control-e>": lambda e: self.exportar_anotacoes(),
             "<Control-space>": lambda e: self.alternar_rolagem(),
             "<Control-l>": lambda e: self.alternar_narracao(),
@@ -2792,8 +3284,7 @@ class TelaLeitor(ctk.CTkFrame):
             text=f"{self.indice_resultado + 1} de {len(self.resultados_busca)}")
         if pagina != self.pagina_atual:
             self.ir_para_pagina(pagina)
-        else:
-            self._destacar_ocorrencias_busca(rolar=True)
+        self._destacar_ocorrencias_busca(rolar=True)
 
     def _limpar_destaques_busca(self):
         try:
@@ -2808,6 +3299,8 @@ class TelaLeitor(ctk.CTkFrame):
             return
         indice = "1.0"
         primeiro = None
+        regiao = self._regiao(self.pagina_atual)
+        inicio_pagina = regiao[1] if regiao else 0
         # Entre as palavras pode haver espaco, tab ou quebra (texto
         # justificado): a busca aceita qualquer um deles.
         palavras = [re.sub(r"([\\.^$*+?(){}\[\]|])", r"\\\1", p)
@@ -2821,7 +3314,8 @@ class TelaLeitor(ctk.CTkFrame):
                 break
             fim = f"{indice}+{tamanho.get()}c"
             self.txt.tag_add("achado", indice, fim)
-            primeiro = primeiro or indice
+            if primeiro is None and self._para_offset(indice) >= inicio_pagina:
+                primeiro = indice
             indice = fim
         if rolar and primeiro:
             self.txt.see(primeiro)
@@ -2833,6 +3327,8 @@ class TelaLeitor(ctk.CTkFrame):
         """Devolve (inicio_char, fim_char, texto) da selecao atual."""
         try:
             faixas = self.txt.tag_ranges("sel")
+            if not faixas and self._par is not None:
+                faixas = self._par.tag_ranges("sel")
             if not faixas:
                 return None
             inicio = self._para_offset(faixas[0])
@@ -2864,8 +3360,10 @@ class TelaLeitor(ctk.CTkFrame):
         if not selecao:
             C.Toast.mostrar(self, "Selecione um trecho primeiro.", "info")
             return
-        inicio, fim, texto = selecao
-        self.banco.adicionar_grifo(self.id_livro, self.pagina_atual, inicio, fim, texto)
+        inicio, fim, _texto = selecao
+        # A selecao pode atravessar paginas: um grifo por pagina.
+        for numero, ini_local, fim_local, trecho in self._fatiar_por_pagina(inicio, fim):
+            self.banco.adicionar_grifo(self.id_livro, numero, ini_local, fim_local, trecho)
         self.area.configure(state="normal")
         self.txt.tag_add("grifo", f"1.0+{inicio}c", f"1.0+{fim}c")
         self.area.configure(state="disabled")
@@ -2878,8 +3376,9 @@ class TelaLeitor(ctk.CTkFrame):
             C.Toast.mostrar(self, "Selecione o trecho grifado.", "info")
             return
         inicio, fim, _texto = selecao
-        removidos = self.banco.remover_grifos_no_intervalo(
-            self.id_livro, self.pagina_atual, inicio, fim)
+        removidos = sum(
+            self.banco.remover_grifos_no_intervalo(self.id_livro, numero, a, b) or 0
+            for numero, a, b, _t in self._fatiar_por_pagina(inicio, fim))
         self.area.configure(state="normal")
         self.txt.tag_remove("grifo", "1.0", "end")
         self._aplicar_grifos()
@@ -2890,15 +3389,29 @@ class TelaLeitor(ctk.CTkFrame):
 
     def _aplicar_grifos(self):
         self.grifos_pagina = self.banco.listar_grifos(self.id_livro, self.pagina_atual)
-        limite = self._para_offset("end-1c")
-        for grifo in self.grifos_pagina:
-            inicio = max(0, min(grifo["inicio_char"], limite))
-            fim = max(0, min(grifo["fim_char"], limite))
-            if fim > inicio:
-                try:
-                    self.txt.tag_add("grifo", f"1.0+{inicio}c", f"1.0+{fim}c")
-                except Exception:
-                    pass
+        regioes = self._regioes or [(self.pagina_atual, 0, self._para_offset("end-1c"))]
+        for numero, inicio_reg, fim_reg in regioes:
+            for grifo in self.banco.listar_grifos(self.id_livro, numero):
+                # Offsets do banco sao LOCAIS da pagina; a regiao os desloca.
+                inicio = inicio_reg + max(0, grifo["inicio_char"])
+                fim = min(fim_reg, inicio_reg + max(0, grifo["fim_char"]))
+                if fim > inicio:
+                    try:
+                        self.txt.tag_add("grifo", f"1.0+{inicio}c", f"1.0+{fim}c")
+                    except Exception:
+                        pass
+
+    def _fatiar_por_pagina(self, inicio, fim):
+        """[(pagina, inicio_local, fim_local, texto)] de um intervalo global."""
+        original = getattr(self, "_texto_render", "") or ""
+        regioes = self._regioes or [(self.pagina_atual, 0, len(original))]
+        fatias = []
+        for numero, inicio_reg, fim_reg in regioes:
+            a, b = max(inicio, inicio_reg), min(fim, fim_reg)
+            if b > a:
+                texto = original[a:b].replace(MARCA_IMAGEM, "")
+                fatias.append((numero, a - inicio_reg, b - inicio_reg, texto))
+        return fatias
 
     def copiar_selecao(self, _=None):
         selecao = self._intervalo_selecionado()
@@ -3447,6 +3960,14 @@ class TelaLeitor(ctk.CTkFrame):
             copiar._faixa = faixa
             self._botoes_codigo.append(copiar)
 
+            enviar = C.botao_icone(
+                self.palco, "mover", lambda t=dados["texto"]: self._enviar_ao_editor(t),
+                "Copiar e ir para o VS Code (cole com Ctrl+V)", tamanho=24)
+            enviar._offset_codigo = dados["cabecalho"]
+            enviar._coluna = 2 if dados["dobravel"] else 1
+            enviar._faixa = faixa
+            self._botoes_codigo.append(enviar)
+
             if dados["dobravel"]:
                 dobrar = C.botao_icone(
                     self.palco, "cima" if not dados["dobrado"] else "baixo",
@@ -3481,8 +4002,7 @@ class TelaLeitor(ctk.CTkFrame):
         # botoes acabavam ancorados na margem vazia, longe do bloco.
         self.after(80, self._reposicionar_botoes_codigo)
 
-    def _alternar_dobra_artigo(self, indice):
-        chave = (self.pagina_atual, indice)
+    def _alternar_dobra_artigo(self, chave):
         if chave in self._artigo_dobrado:
             self._artigo_dobrado.discard(chave)
         else:
@@ -3495,7 +4015,8 @@ class TelaLeitor(ctk.CTkFrame):
         if not self._faixas_artigo:
             C.Toast.mostrar(self, "Nenhum artigo nesta pagina.", "info")
             return
-        todos = {(self.pagina_atual, a["indice"]) for a in self._faixas_artigo}
+        todos = {a["indice"] for a in self._faixas_artigo
+                 if a.get("pagina") == self.pagina_atual}
         if todos <= self._artigo_dobrado:
             self._artigo_dobrado -= todos
             aviso = "Artigos expandidos."
@@ -3505,8 +4026,7 @@ class TelaLeitor(ctk.CTkFrame):
         self.renderizar(manter_rolagem=True)
         C.Toast.mostrar(self, aviso, "ok", 1500)
 
-    def _alternar_dobra(self, indice):
-        chave = (self.pagina_atual, indice)
+    def _alternar_dobra(self, chave):
         if chave in self._codigo_dobrado:
             self._codigo_dobrado.discard(chave)
         else:
@@ -3643,7 +4163,8 @@ class TelaLeitor(ctk.CTkFrame):
 
     def copiar_codigo_da_pagina(self, _=None):
         """Junta os blocos de codigo da pagina, limpos para colar num editor."""
-        blocos = [d["texto"] for d in self._faixas_codigo]
+        blocos = [d["texto"] for d in self._faixas_codigo
+                  if d.get("pagina", self.pagina_atual) == self.pagina_atual]
         if not blocos:
             C.Toast.mostrar(self, "Nenhum bloco de codigo nesta pagina.", "info")
             return
@@ -3786,6 +4307,9 @@ class TelaLeitor(ctk.CTkFrame):
                 return
             self._conversar_com_livro(pergunta)
             return
+        if acao == ACAO_CODIGO:
+            self._relacionar_com_codigo(pergunta)
+            return
 
         texto = getattr(self, "_texto_ia_forcado", None) or self._texto_da_pagina()
         self._texto_ia_forcado = None
@@ -3898,6 +4422,173 @@ class TelaLeitor(ctk.CTkFrame):
             self.clipboard_append(conteudo)
             C.Toast.mostrar(self, "Resultado copiado.", "ok", 1200)
 
+    # ======================================================= VS CODE
+    def _janela_do_editor(self):
+        """(alca, titulo) do VS Code (ou Cursor/VSCodium) mais a vista.
+
+        Prefere a janela que divide a tela com o leitor; se ela nao for um
+        editor, a primeira janela de editor na ordem de empilhamento.
+        """
+        candidatas = []
+        try:
+            vizinha = contexto.janela_vizinha(self._retangulo_proprio())
+            if vizinha:
+                candidatas.append((vizinha[0], vizinha[2]))
+        except Exception:
+            pass
+        try:
+            candidatas += [(a, t) for a, _r, t in contexto._janelas_visiveis()]
+        except Exception:
+            pass
+        for alca, titulo in candidatas:
+            if titulo and vscode.interpretar_titulo(titulo):
+                return alca, titulo
+        return None, None
+
+    def _relacionar_com_codigo(self, pergunta):
+        """Explica a pagina do livro aplicada ao arquivo aberto no VS Code.
+
+        Le o ARQUIVO do disco (o VS Code nao publica o texto do editor pela
+        acessibilidade) e manda pagina + codigo ao assistente. So acontece
+        quando a pessoa pede, e na primeira vez o Lumina avisa que o codigo
+        vai para o provedor de IA configurado.
+        """
+        if self._ia_ocupada:
+            return
+        if not self.cfg.obter_bool("vscode_consentiu", False):
+            def consentiu():
+                self.cfg.definir("vscode_consentiu", "1")
+                self._relacionar_com_codigo(pergunta)
+            Modais.confirmar(
+                self, "Enviar seu codigo ao assistente?",
+                "O Lumina vai ler o arquivo aberto no VS Code e enviar o "
+                "conteudo, junto com esta pagina, ao provedor de IA "
+                "configurado (na IA local, nada sai do computador).\n\n"
+                "So acontece quando voce escolher esta acao.",
+                texto_ok="Entendi, enviar", ao_confirmar=consentiu)
+            return
+        self._ia_ocupada = True
+        self.btn_ia_processar.configure(state="disabled", text="Lendo o VS Code…")
+        self._escrever_ia("Procurando o arquivo aberto no VS Code…")
+        alca, titulo = self._janela_do_editor()
+        pagina = self._texto_da_pagina()[:5000]
+        numero = self.pagina_atual + 1
+        id_livro = self.id_livro
+
+        def trabalhador():
+            try:
+                if not titulo:
+                    raise ValueError("Nenhuma janela do VS Code aberta.")
+                arquivo = vscode.arquivo_ativo(titulo)
+                if arquivo is None:
+                    raise ValueError("O VS Code nao esta com um arquivo aberto no editor "
+                                     "(abra um arquivo e tente de novo).")
+                if arquivo.remoto:
+                    raise ValueError(f"“{arquivo.nome}” esta num projeto remoto "
+                                     "(SSH/WSL): o arquivo nao esta neste computador.")
+                if not arquivo.caminho and "." not in arquivo.nome:
+                    raise ValueError(f"A aba ativa do VS Code (“{arquivo.nome}”) nao e um "
+                                     "arquivo. Clique num arquivo de codigo e tente de novo.")
+                if not arquivo.caminho:
+                    raise ValueError(f"Nao encontrei “{arquivo.nome}” no disco.")
+                codigo = vscode.ler_trecho(arquivo.caminho, max_chars=9000)
+                aviso = ("\n(Arquivo com alteracoes nao salvas: usei a versao do disco.)"
+                         if arquivo.sujo else "")
+                texto = (f"TRECHO DO LIVRO (pagina {numero}):\n{pagina}\n\n"
+                         f"ARQUIVO DO LEITOR: {arquivo.nome} ({arquivo.linguagem})\n"
+                         f"```{arquivo.linguagem}\n{codigo}\n```")
+                q = pergunta or ("Explique como o conteudo desta pagina do livro se aplica "
+                                 "a este arquivo. Aponte onde o codigo ja segue o livro, "
+                                 "onde diverge e o que poderia melhorar, citando linhas.")
+                resposta = self.ia_manager.executar_acao("Responder pergunta", texto, q)
+                resultado = f"📎 {arquivo.nome}{aviso}\n\n{resposta}"
+            except Exception as erro:
+                resultado = str(erro)
+            self._na_ui(lambda: self._concluir_ia(resultado, id_livro))
+
+        threading.Thread(target=trabalhador, daemon=True).start()
+
+    def _enviar_ao_editor(self, codigo):
+        """Copia o bloco limpo e traz o VS Code para a frente: e so colar."""
+        limpo = codigo_util.para_area_transferencia(codigo)
+        self.clipboard_clear()
+        self.clipboard_append(limpo)
+        alca, _titulo = self._janela_do_editor()
+        if alca:
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                if user32.IsIconic(alca):
+                    user32.ShowWindow(alca, 9)          # SW_RESTORE
+                user32.SetForegroundWindow(alca)
+                C.Toast.mostrar(self, "Codigo copiado — cole no VS Code com Ctrl+V.",
+                                "ok", 2200)
+                return
+            except Exception:
+                pass
+        C.Toast.mostrar(self, "Codigo copiado. (VS Code nao encontrado.)", "info", 2200)
+
+    # ==================================================== DICIONARIO
+    def consultar_dicionario(self, _=None):
+        selecao = self._intervalo_selecionado()
+        termo = (selecao[2] if selecao else "").strip()
+        if not termo:
+            C.Toast.mostrar(self, "Selecione uma palavra ou frase.", "info")
+            return
+        janela = ctk.CTkToplevel(self)
+        janela.title("Dicionario")
+        janela.geometry(f"380x320+{self.winfo_pointerx() - 190}+{self.winfo_pointery() + 18}")
+        janela.configure(fg_color=T.superficie)
+        janela.transient(self.winfo_toplevel())
+        janela.bind("<Escape>", lambda e: janela.destroy())
+        C.rotulo(janela, termo[:60], 15, "bold").pack(fill="x", padx=ESP["md"],
+                                                      pady=(ESP["md"], 2))
+        rodape = C.rotulo(janela, "Consultando…", 9, "normal", "texto_suave")
+        corpo = ctk.CTkTextbox(janela, wrap="word", fg_color=T.superficie_alt,
+                               text_color=T.texto, font=ctk.CTkFont(FONTE_UI, 12),
+                               corner_radius=RAIO["sm"], border_width=0)
+        corpo.pack(fill="both", expand=True, padx=ESP["md"], pady=ESP["sm"])
+        rodape.pack(fill="x", padx=ESP["md"], pady=(0, ESP["sm"]))
+        janela.after(150, janela.lift)
+
+        def mostrar(consulta):
+            if not janela.winfo_exists():
+                return
+            partes = []
+            if consulta.traducao:
+                partes.append(f"Traducao ({consulta.idioma_origem} → "
+                              f"{consulta.idioma_destino}):\n{consulta.traducao}")
+            if consulta.definicoes:
+                partes.append("Definicoes:\n" + "\n".join(f"• {d}" for d in consulta.definicoes))
+            if consulta.erro and not partes:
+                partes.append(consulta.erro)
+            corpo.insert("1.0", "\n\n".join(partes) or "Nada encontrado.")
+            corpo.configure(state="disabled")
+            rodape.configure(text=f"Fonte: {consulta.fonte}" if consulta.fonte else "")
+
+        def trabalhador():
+            consulta = dicionario.consultar(termo)
+            self._na_ui(lambda: mostrar(consulta))
+
+        threading.Thread(target=trabalhador, daemon=True).start()
+
+    # ======================================================= REVISAO
+    def abrir_revisao(self, _=None):
+        from ui.revisao import JanelaRevisao
+
+        def ir_para(id_livro, pagina):
+            if id_livro == self.id_livro:
+                self.ir_para_pagina(pagina)
+            else:
+                self.banco.definir_pagina(id_livro, pagina)
+                self.controlador.mostrar_tela("leitor", id_livro)
+
+        janela = getattr(self, "_janela_revisao", None)
+        if janela is not None and janela.winfo_exists():
+            janela.lift()
+            return
+        self._janela_revisao = JanelaRevisao(self, ao_ir_para=ir_para, id_livro=self.id_livro)
+
     def _texto_da_pagina(self):
         return "\n\n".join(b.texto for b in self.blocos_render
                            if b.texto and b.tipo != "aviso")
@@ -3925,6 +4616,7 @@ class TelaLeitor(ctk.CTkFrame):
     def _aplicar_preferencias(self, mudou_tema=False, mudou_modo=False):
         if mudou_tema:
             self.controlador.aplicar_tema(self.cfg.obter("tema"))
+        self._atualizar_duas_folhas()
         if self.documento:
             self.renderizar(manter_rolagem=True)
         else:
@@ -4019,6 +4711,7 @@ class TelaLeitor(ctk.CTkFrame):
                     self.painel_ia.grid_remove()
                     C.marcar_ativo(self.btn_ia, False)
 
+        self._atualizar_duas_folhas()
         self._ajustar_coluna()
         self._estado_setas = None
         self._atualizar_setas()
@@ -4033,10 +4726,12 @@ class TelaLeitor(ctk.CTkFrame):
     def _atualizar_rodape(self):
         atual = self.pagina_atual + 1
         total = max(1, self.total_paginas)
-        folhas = len(self._grade_folhas) if self._em_folha() else 0
-        if folhas > 1:
-            self.lbl_pagina.configure(
-                text=f"{atual} / {total}  ·  folha {self._folha_atual + 1}/{folhas}")
+        folha = self._folha_na_pagina() if self._em_folha() else None
+        if folha and folha[1] > 1:
+            # Em janela estreita o rotulo longo invadia o tempo restante.
+            texto = (f"{atual}/{total} · {folha[0]}/{folha[1]}" if self._compacto
+                     else f"{atual} / {total}  ·  folha {folha[0]}/{folha[1]}")
+            self.lbl_pagina.configure(text=texto)
         else:
             self.lbl_pagina.configure(text=f"{atual} / {total}")
         self.progresso.set(atual / total)
@@ -4195,6 +4890,11 @@ class PopoverTipografia(ctk.CTkFrame):
         self._switch(opcoes, "Mostrar imagens", "mostrar_imagens", True)
         self._switch(opcoes, "Texto justificado (alinhado nas duas margens)",
                      "justificar", True)
+        self._switch(opcoes, "Folhear: duas folhas lado a lado em janela larga",
+                     "duas_folhas", True)
+        self._switch(opcoes, "Folhear: animar a virada da folha", "animar_folha", True)
+        self._switch(opcoes, "Reconhecer texto (OCR) em paginas digitalizadas "
+                             "(vale ao reabrir o livro)", "ocr_ativo", True)
 
     # ----------------------------------------------------- este livro
     def _secao_do_livro(self):

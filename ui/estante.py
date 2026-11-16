@@ -11,6 +11,7 @@ seletor de pasta -- em meia tela ela consumiria quase toda a largura util.
 import os
 import subprocess
 import sys
+import tkinter as tk
 import unicodedata
 from tkinter import filedialog
 
@@ -24,7 +25,7 @@ from configuracoes import (APP_NOME, APP_VERSAO, CATEGORIAS, ESP, FONTE_UI,
                            adivinhar_categoria)
 from core.branding import carregar_logo
 from database.pastas import SOLTOS, TODOS
-from services.pdf_service import TIPOS_ARQUIVO
+from services.pdf_service import TIPOS_ARQUIVO, eh_livro
 from ui.modais import Modais
 
 LARGURA_CARTAO = 178
@@ -77,8 +78,22 @@ class TelaEstante(ctk.CTkFrame):
         self._compacto = None
         self._agendado_layout = None
 
+        # Selecao multipla (Ctrl/Shift+clique). Guarda ids, nao widgets: a
+        # estante e redesenhada inteira a cada recarga.
+        self.selecionados = set()
+        self._ancora = None              # ultimo clique, origem do Shift+clique
+        self._ordem_visivel = []         # ids na ordem em que aparecem
+        self._visuais = {}               # id_livro -> widget do cartao/linha
+        self._importando = False
+        self._sobreposicao = None
+
         self._carregar_logo()
         self._construir()
+        self._ligar_arrastar_soltar()
+        # bind_all, e nao bind na janela: o main.py liga o Esc da janela
+        # DEPOIS de criar esta tela, e um bind comum seria sobrescrito. Via
+        # tk.Misc porque o CustomTkinter proibe `bind_all` nos seus widgets.
+        tk.Misc.bind_all(self, "<Escape>", self._ao_esc_selecao, add="+")
 
     # ------------------------------------------------------------------ estado
     def _pasta_salva(self):
@@ -229,8 +244,12 @@ class TelaEstante(ctk.CTkFrame):
 
     # -------------------------------------------------------------- conteudo
     def _construir_conteudo(self, pai):
-        conteudo = C.quadro(pai, "fundo")
+        conteudo = C.quadro(pai, "fundo", raio=RAIO["md"])
         conteudo.grid(row=0, column=1, sticky="nsew")
+        # Borda de "pode soltar" do arrastar-e-soltar (o CTkScrollableFrame
+        # nao aceita border_color, entao a borda vai neste quadro de fora).
+        conteudo.configure(border_width=0, border_color=T.destaque)
+        self.conteudo = conteudo
         conteudo.grid_rowconfigure(1, weight=1)
         conteudo.grid_columnconfigure(0, weight=1)
 
@@ -272,6 +291,38 @@ class TelaEstante(ctk.CTkFrame):
 
         self.area = C.rolavel(conteudo, "fundo")
         self.area.grid(row=1, column=0, sticky="nsew", padx=ESP["lg"], pady=ESP["md"])
+
+        self._construir_barra_selecao(conteudo)
+
+    def _construir_barra_selecao(self, pai):
+        """Barra de acoes em lote; so aparece com livros selecionados."""
+        barra = C.quadro(pai, "superficie", raio=RAIO["md"])
+        barra.configure(border_width=1, border_color=T.destaque)
+        C.registrar_estilo(barra, border_color="destaque")
+        barra.grid(row=2, column=0, sticky="ew", padx=ESP["lg"], pady=(0, ESP["sm"]))
+        barra.grid_columnconfigure(0, weight=1)
+
+        self.lbl_selecao = C.rotulo(barra, "", 12, "bold")
+        self.lbl_selecao.grid(row=0, column=0, sticky="w", padx=ESP["md"], pady=ESP["sm"])
+
+        self.btns_selecao = {}
+        acoes = [
+            ("mover", "Mover para pasta", self._mover_selecionados, "secundario", 140),
+            ("lido", "Marcar como lido", self._marcar_selecionados_lidos, "secundario", 140),
+            ("remover", "Remover da estante", self._remover_selecionados, "perigo", 150),
+            ("cancelar", "Cancelar", self.limpar_selecao, "fantasma", 90),
+        ]
+        for coluna, (chave, texto, comando, variante, largura) in enumerate(acoes, 1):
+            botao = C.botao(barra, texto, comando, largura=largura, altura=30,
+                            variante=variante)
+            botao.grid(row=0, column=coluna, padx=(0, ESP["sm"]), pady=ESP["sm"])
+            botao._texto_cheio = texto
+            botao._largura_cheia = largura
+            self.btns_selecao[chave] = botao
+        C.Tooltip(self.btns_selecao["lido"],
+                  "Leva o progresso a 100% (ultima pagina)")
+        self.barra_selecao = barra
+        barra.grid_remove()
 
     # =====================================================================
     # DESENHO
@@ -441,10 +492,19 @@ class TelaEstante(ctk.CTkFrame):
         for widget in self.area.winfo_children():
             widget.destroy()
         C.limpar_registro_mortos()
+        self._visuais = {}
 
         itens = self._livros_visiveis()
         subpastas = ([] if self.filtro.strip() or self.pasta_atual in (TODOS, SOLTOS)
                      else self.pastas.filhas(self.pasta_atual))
+
+        # Selecao so do que esta na tela: agir sobre um livro escondido pelo
+        # filtro seria uma surpresa (e "Remover" apagaria o que nao se ve).
+        self._ordem_visivel = [l["id_livro"] for l in itens]
+        self.selecionados &= set(self._ordem_visivel)
+        if self._ancora not in self.selecionados:
+            self._ancora = None
+        self._atualizar_barra_selecao()
 
         if not itens and not subpastas:
             self._estado_vazio_apropriado()
@@ -566,11 +626,15 @@ class TelaEstante(ctk.CTkFrame):
                       "Mais acoes", tamanho=26).grid(row=0, column=3, rowspan=3,
                                                      padx=(0, ESP["xs"]))
 
-        abrir = lambda _=None: self.abrir_livro(livro)
+        abrir = lambda _=None: self._clique_livro(livro)
         for widget in (caixa, capa, titulo):
             widget.bind("<Button-1>", abrir)
             widget.bind("<Button-3>", lambda e, l=livro: self._menu_livro(l))
+        self._ligar_selecao(livro["id_livro"], (caixa, capa, titulo))
         self._realce_lista(caixa, (caixa, capa, titulo))
+        caixa._modo_estante = "lista"
+        self._visuais[livro["id_livro"]] = caixa
+        self._pintar_selecao(livro["id_livro"])
         return caixa
 
     def _legenda_do_livro(self, livro, existe):
@@ -588,6 +652,8 @@ class TelaEstante(ctk.CTkFrame):
 
     @staticmethod
     def _realce_lista(caixa, widgets):
+        # Na lista a selecao e marcada pela borda, entao o hover (fundo) nao
+        # precisa saber dela.
         def entrar(_=None):
             caixa.configure(fg_color=T.superficie_alt)
 
@@ -824,21 +890,27 @@ class TelaEstante(ctk.CTkFrame):
         C.botao_icone(rodape, "mais_opcoes", lambda: self._menu_livro(livro), "Mais acoes",
                       tamanho=26).pack(side="right")
 
-        abrir = lambda _=None: self.abrir_livro(livro)
+        abrir = lambda _=None: self._clique_livro(livro)
         for widget in (widget_capa, lbl_titulo):
             widget.bind("<Button-1>", abrir)
         cartao.bind("<Double-Button-1>", abrir)
         for widget in (cartao, widget_capa, lbl_titulo):
             widget.bind("<Button-3>", lambda e, l=livro: self._menu_livro(l))
-        self._realce(cartao, (cartao, widget_capa, lbl_titulo))
+        self._ligar_selecao(id_livro, (cartao, widget_capa, lbl_titulo))
+        self._realce(cartao, (cartao, widget_capa, lbl_titulo), id_livro)
+        cartao._modo_estante = "grade"
+        self._visuais[id_livro] = cartao
+        self._pintar_selecao(id_livro)
         return cartao
 
-    @staticmethod
-    def _realce(cartao, widgets):
+    def _realce(self, cartao, widgets, id_livro=None):
         def entrar(_=None):
             cartao.configure(border_color=T.destaque)
 
         def sair(_=None):
+            # Cartao selecionado mantem a borda de destaque ao perder o hover.
+            if id_livro is not None and id_livro in self.selecionados:
+                return
             cartao.configure(border_color=T.superficie)
 
         for widget in widgets:
@@ -881,6 +953,9 @@ class TelaEstante(ctk.CTkFrame):
     # =====================================================================
     def selecionar_pasta(self, chave):
         self.pasta_atual = chave
+        # Trocar de pasta e trocar de contexto: a selecao anterior nao vale.
+        self.selecionados.clear()
+        self._ancora = None
         if isinstance(chave, int):
             # Abre a trilha ate a pasta escolhida para ela ficar visivel.
             for id_pasta, _ in self.pastas.caminho(chave)[:-1]:
@@ -996,15 +1071,32 @@ class TelaEstante(ctk.CTkFrame):
             atual if atual else "Sem categoria", aplicar)
 
     def _mover_livro(self, livro):
+        self._mover_livros([livro])
+
+    def _mover_livros(self, livros, ao_concluir=None):
+        """Um livro (menu "⋯") ou varios (selecao) vao para a mesma pasta."""
+        if not livros:
+            return
+
         def aplicar(destino):
-            self.pastas.definir_pasta_do_livro(livro["id_livro"], destino)
+            for livro in livros:
+                self.pastas.definir_pasta_do_livro(livro["id_livro"], destino)
+            if ao_concluir:
+                ao_concluir()
             self.recarregar()
             nome = self._nome_da_pasta(destino) or "Sem pasta"
-            C.Toast.mostrar(self, f"Movido para “{nome}”.", "ok", 1600)
+            quantos = "Movido" if len(livros) == 1 else f"{len(livros)} livros movidos"
+            C.Toast.mostrar(self, f"{quantos} para “{nome}”.", "ok", 1600)
 
-        Modais.escolher_pasta(self, self.pastas, aplicar,
-                              titulo=f"Mover “{self._encurtar(livro.get('titulo'), 34)}” para",
-                              atual=livro.get("id_pasta"), permitir_raiz=True)
+        if len(livros) == 1:
+            titulo = f"Mover “{self._encurtar(livros[0].get('titulo'), 34)}” para"
+        else:
+            titulo = f"Mover {len(livros)} livros para"
+        # Pasta atual marcada so se todos ja moram na mesma.
+        atuais = {livro.get("id_pasta") for livro in livros}
+        Modais.escolher_pasta(self, self.pastas, aplicar, titulo=titulo,
+                              atual=atuais.pop() if len(atuais) == 1 else None,
+                              permitir_raiz=True)
 
     def _alternar_subpastas(self):
         self.cfg.definir_bool("incluir_subpastas", bool(self.switch_sub.get()))
@@ -1043,6 +1135,11 @@ class TelaEstante(ctk.CTkFrame):
         caminho = livro.get("caminho_pdf") or ""
         if not os.path.exists(caminho):
             self._arquivo_ausente(livro)
+            return
+        # Senha lembrada pode deixar de servir (banco copiado de outra conta
+        # do Windows, arquivo trocado por outro com senha nova): pergunta de
+        # novo aqui, porque o leitor so sabe dizer "nao foi possivel abrir".
+        if not self.desbloquear(caminho):
             return
         self.controlador.mostrar_tela("leitor", livro["id_livro"])
 
@@ -1090,13 +1187,53 @@ class TelaEstante(ctk.CTkFrame):
             parent=self.winfo_toplevel(), title="Escolher livros (PDF ou EPUB)", filetypes=TIPOS_ARQUIVO)
         if not caminhos:
             return
+        self.importar_arquivos(caminhos)
 
+    def desbloquear(self, caminho) -> bool:
+        """Garante que um PDF protegido possa ser aberto; pede a senha se preciso.
+
+        True se o arquivo nao tem senha, ja tinha uma lembrada que funciona,
+        ou o usuario acertou agora. A senha nova fica na memoria da sessao e,
+        cifrada com DPAPI, no banco -- reabrir o livro nao pergunta de novo.
+        """
+        if not self.pdf_service.precisa_senha(caminho):
+            return True
+        senha = C.pedir_senha(self, os.path.basename(caminho),
+                              lambda s: self.pdf_service.testar_senha(caminho, s))
+        if senha is None:
+            return False
+        self.pdf_service.lembrar_senha(caminho, senha)
+        try:
+            if not self.banco.definir_senha(self.pdf_service.gerar_id_unico(caminho), senha):
+                print("[Estante] DPAPI indisponivel: senha lembrada so nesta sessao.")
+        except Exception as erro:
+            print(f"[Estante] Nao foi possivel guardar a senha: {erro}")
+        return True
+
+    def importar_arquivos(self, caminhos):
+        """Adiciona arquivos a pasta aberta (botao "Adicionar" e arrastar-soltar)."""
+        # O pedido de senha espera a resposta com o resto da janela viva: um
+        # segundo "Adicionar" ou outro arrasto nesse meio tempo nao pode
+        # comecar uma importacao paralela.
+        if self._importando:
+            C.Toast.mostrar(self, "Ainda adicionando os livros anteriores…", "info", 1600)
+            return
+        self._importando = True
+        try:
+            self._importar(caminhos)
+        finally:
+            self._importando = False
+
+    def _importar(self, caminhos):
         # Os novos livros caem na pasta que esta aberta -- e o comportamento
         # esperado de qualquer gerenciador de arquivos.
         destino = self.pasta_atual if isinstance(self.pasta_atual, int) else None
 
-        novos, repetidos, falhas = 0, 0, 0
+        novos, repetidos, falhas, protegidos, ignorados = 0, 0, 0, 0, 0
         for caminho in caminhos:
+            if not eh_livro(caminho):
+                ignorados += 1
+                continue
             if not os.path.exists(caminho):
                 falhas += 1
                 continue
@@ -1106,8 +1243,8 @@ class TelaEstante(ctk.CTkFrame):
                     self.banco.definir_caminho(id_livro, caminho)
                     repetidos += 1
                     continue
-                if self.pdf_service.esta_protegido(caminho):
-                    falhas += 1
+                if not self.desbloquear(caminho):
+                    protegidos += 1
                     continue
                 meta = self.pdf_service.extrair_metadados(caminho)
                 capa = self.pdf_service.extrair_capa(caminho, id_livro)
@@ -1126,10 +1263,14 @@ class TelaEstante(ctk.CTkFrame):
             partes.append(f"{novos} adicionado(s)" + (f" em “{nome}”" if nome else ""))
         if repetidos:
             partes.append(f"{repetidos} ja na estante")
+        if protegidos:
+            partes.append(f"{protegidos} protegido(s) sem senha")
         if falhas:
-            partes.append(f"{falhas} com erro ou protegido(s)")
+            partes.append(f"{falhas} com erro")
+        if ignorados:
+            partes.append(f"{ignorados} ignorado(s): nao e PDF nem EPUB")
         C.Toast.mostrar(self, "  ·  ".join(partes) or "Nada a fazer",
-                        "ok" if novos else "info")
+                        "ok" if novos else "info", 2600)
 
     def _menu_livro(self, livro):
         Modais.menu_livro(
@@ -1185,17 +1326,244 @@ class TelaEstante(ctk.CTkFrame):
         C.Toast.mostrar(self, "Capa atualizada.", "ok", 1400)
 
     def _remover(self, livro):
-        def confirmar():
-            self.banco.remover_livro(livro["id_livro"])
-            self.capas.pop(livro["id_livro"], None)
-            self.recarregar()
-            C.Toast.mostrar(self, "Livro removido da biblioteca.", "ok")
+        self._remover_livros([livro])
 
+    def _remover_livros(self, livros, ao_concluir=None):
+        """Remove um ou varios livros com UMA confirmacao so."""
+        if not livros:
+            return
+
+        def confirmar():
+            for livro in livros:
+                self.banco.remover_livro(livro["id_livro"])
+                self.capas.pop(livro["id_livro"], None)
+                self.miniaturas.pop(livro["id_livro"], None)
+            if ao_concluir:
+                ao_concluir()
+            self.recarregar()
+            C.Toast.mostrar(self, "Livro removido da biblioteca." if len(livros) == 1
+                            else f"{len(livros)} livros removidos da biblioteca.", "ok")
+
+        if len(livros) == 1:
+            alvo = f"“{livros[0].get('titulo')}” sai"
+        else:
+            nomes = "\n".join("• " + self._encurtar(l.get("titulo") or "Sem titulo", 48)
+                              for l in livros[:4])
+            resto = f"\n• e mais {len(livros) - 4}" if len(livros) > 4 else ""
+            alvo = f"{len(livros)} livros saem"
+            alvo = f"{nomes}{resto}\n\n{alvo}"
         Modais.confirmar(
             self, "Remover da biblioteca",
-            f"“{livro.get('titulo')}” sai da estante junto com seus grifos, "
+            f"{alvo} da estante junto com seus grifos, "
             "marcadores e anotacoes.\n\nO arquivo original nao e apagado do disco.",
             texto_ok="Remover", perigo=True, ao_confirmar=confirmar)
+
+    # =====================================================================
+    # SELECAO MULTIPLA
+    # =====================================================================
+    def _ligar_selecao(self, id_livro, widgets):
+        # Tk escolhe o binding mais especifico: com Ctrl ou Shift apertado o
+        # <Button-1> comum (abrir o livro) nao dispara.
+        for widget in widgets:
+            widget.bind("<Control-Button-1>",
+                        lambda e, i=id_livro: self.clique_selecao(i, "ctrl"))
+            widget.bind("<Shift-Button-1>",
+                        lambda e, i=id_livro: self.clique_selecao(i, "shift"))
+
+    def _clique_livro(self, livro):
+        """Clique simples: abre o livro -- ou, com selecao ativa, marca/desmarca.
+
+        Em modo de selecao abrir o livro no meio do caminho jogaria fora o
+        que ja foi escolhido; marcar e o que a pessoa espera.
+        """
+        if self.selecionados:
+            self.clique_selecao(livro["id_livro"], "ctrl")
+        else:
+            self.abrir_livro(livro)
+
+    def clique_selecao(self, id_livro, modo="ctrl"):
+        """modo 'ctrl' alterna um livro; 'shift' seleciona o intervalo desde a ancora."""
+        if modo == "shift" and self._ancora in self._ordem_visivel \
+                and id_livro in self._ordem_visivel:
+            a = self._ordem_visivel.index(self._ancora)
+            b = self._ordem_visivel.index(id_livro)
+            inicio, fim = min(a, b), max(a, b)
+            mudados = set(self._ordem_visivel[inicio:fim + 1])
+            self.selecionados |= mudados
+        else:
+            mudados = {id_livro}
+            if id_livro in self.selecionados:
+                self.selecionados.discard(id_livro)
+            else:
+                self.selecionados.add(id_livro)
+            self._ancora = id_livro
+        # Repinta so o que mudou: redesenhar a estante inteira a cada clique
+        # recriaria todas as capas.
+        for chave in mudados:
+            self._pintar_selecao(chave)
+        self._atualizar_barra_selecao()
+        return "break"
+
+    def limpar_selecao(self):
+        antigos = set(self.selecionados)
+        self.selecionados.clear()
+        self._ancora = None
+        for chave in antigos:
+            self._pintar_selecao(chave)
+        self._atualizar_barra_selecao()
+
+    def _pintar_selecao(self, id_livro):
+        widget = self._visuais.get(id_livro)
+        if widget is None:
+            return
+        try:
+            if not widget.winfo_exists():
+                return
+            marcado = id_livro in self.selecionados
+            if getattr(widget, "_modo_estante", "") == "grade":
+                widget.configure(border_width=2 if marcado else 1,
+                                 border_color=T.destaque if marcado else T.superficie)
+            else:
+                widget.configure(border_width=2 if marcado else 0,
+                                 border_color=T.destaque if marcado else T.superficie)
+        except Exception:
+            pass
+
+    def _atualizar_barra_selecao(self):
+        barra = getattr(self, "barra_selecao", None)
+        if barra is None:
+            return
+        quantos = len(self.selecionados)
+        if not quantos:
+            barra.grid_remove()
+            return
+        self.lbl_selecao.configure(
+            text="1 selecionado" if quantos == 1 else f"{quantos} selecionados")
+        # Em meia tela os rotulos inteiros empurrariam os botoes para fora.
+        curtos = {"mover": "Mover", "lido": "Lido", "remover": "Remover", "cancelar": "✕"}
+        for chave, botao in self.btns_selecao.items():
+            if self._compacto:
+                botao.configure(text=curtos[chave], width=40 if chave == "cancelar" else 70)
+            else:
+                botao.configure(text=botao._texto_cheio, width=botao._largura_cheia)
+        barra.grid()
+
+    def _livros_selecionados(self):
+        return [l for l in self.livros if l["id_livro"] in self.selecionados]
+
+    def _mover_selecionados(self):
+        self._mover_livros(self._livros_selecionados(), ao_concluir=self.limpar_selecao)
+
+    def _remover_selecionados(self):
+        self._remover_livros(self._livros_selecionados(), ao_concluir=self.limpar_selecao)
+
+    def _marcar_selecionados_lidos(self):
+        livros = self._livros_selecionados()
+        if not livros:
+            return
+        marcados = self.banco.marcar_como_lido([l["id_livro"] for l in livros])
+        sem_paginas = len(livros) - marcados
+        self.limpar_selecao()
+        self.recarregar()
+        mensagem = (f"{marcados} marcado(s) como lido(s)." if marcados
+                    else "Nenhum livro marcado.")
+        if sem_paginas:
+            mensagem += f"  ·  {sem_paginas} sem contagem de paginas"
+        C.Toast.mostrar(self, mensagem, "ok" if marcados else "info", 1800)
+
+    def _ao_esc_selecao(self, evento=None):
+        if not self.selecionados or getattr(self.controlador, "tela_ativa", None) != "estante":
+            return
+        # Esc dentro de um modal (escolher pasta, confirmar) fecha o modal;
+        # nao pode desfazer a selecao que ele esta usando.
+        try:
+            if evento is not None and evento.widget.winfo_toplevel() is not self.winfo_toplevel():
+                return
+        except Exception:
+            pass
+        self.limpar_selecao()
+
+    # =====================================================================
+    # ARRASTAR E SOLTAR
+    # =====================================================================
+    def _ligar_arrastar_soltar(self):
+        """Aceita PDFs/EPUBs arrastados do Explorer sobre a estante.
+
+        Depende do tkdnd (pacote tkinterdnd2) carregado pela janela principal;
+        sem ele a estante funciona igual, so sem arrastar.
+        """
+        if not getattr(self.controlador, "dnd_disponivel", False):
+            return
+        try:
+            from tkinterdnd2 import COPY, DND_FILES
+            self._acao_dnd = COPY
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<DropEnter>>", self._ao_arrastar_entrar)
+            self.dnd_bind("<<DropPosition>>", lambda e: self._acao_dnd)
+            self.dnd_bind("<<DropLeave>>", self._ao_arrastar_sair)
+            self.dnd_bind("<<Drop>>", self._ao_soltar)
+        except Exception as erro:
+            print(f"[Estante] Arrastar e soltar indisponivel: {erro}")
+
+    def _ao_arrastar_entrar(self, _=None):
+        self._mostrar_sobreposicao()
+        return self._acao_dnd
+
+    def _ao_arrastar_sair(self, _=None):
+        self._esconder_sobreposicao()
+
+    def _ao_soltar(self, evento):
+        self._esconder_sobreposicao()
+        try:
+            caminhos = list(self.tk.splitlist(evento.data))
+        except Exception:
+            caminhos = []
+        # Fora do evento: o Explorer fica esperando o drop terminar, e o
+        # pedido de senha de um PDF protegido o deixaria congelado.
+        self.after(20, lambda: self.importar_arquivos(self._expandir_soltos(caminhos)))
+        return self._acao_dnd
+
+    @staticmethod
+    def _expandir_soltos(caminhos):
+        """Arquivos soltos + livros dentro de pastas soltas (recursivo)."""
+        saida = []
+        for caminho in caminhos:
+            if os.path.isdir(caminho):
+                for raiz, _, arquivos in os.walk(caminho):
+                    saida.extend(os.path.join(raiz, nome) for nome in sorted(arquivos)
+                                 if eh_livro(nome))
+            else:
+                saida.append(caminho)
+        return saida
+
+    def _mostrar_sobreposicao(self):
+        """Destaque de "pode soltar": borda na area dos livros + aviso no rodape.
+
+        Nada de widget novo por cima: no Windows cada widget Tk e uma janela
+        propria, e criar uma sob o cursor no meio do arrasto pode fazer o OLE
+        trocar de alvo (sai/entra em laco, piscando).
+        """
+        if self._sobreposicao is not None:
+            return
+        destino = self._nome_da_pasta(self.pasta_atual) if isinstance(self.pasta_atual, int) \
+            else ""
+        self._sobreposicao = self.rodape.cget("text")
+        try:
+            self.conteudo.configure(border_width=2, border_color=T.destaque)
+        except Exception:
+            pass
+        self.rodape.configure(text=f"Solte para adicionar em “{destino}”" if destino
+                              else "Solte para adicionar a estante (PDF ou EPUB)")
+
+    def _esconder_sobreposicao(self):
+        if self._sobreposicao is None:
+            return
+        try:
+            self.conteudo.configure(border_width=0)
+        except Exception:
+            pass
+        self.rodape.configure(text=self._sobreposicao)
+        self._sobreposicao = None
 
     def _abrir_configuracoes(self):
         Modais.abrir_configuracoes(self, self.cfg, ao_mudar_tema=self.controlador.aplicar_tema)
@@ -1265,6 +1633,7 @@ class TelaEstante(ctk.CTkFrame):
         # senao o modo compacto e o recolhimento manual se desfariam um ao
         # outro conforme a ordem em que acontecessem.
         self._aplicar_barra_pastas()
+        self._atualizar_barra_selecao()
         return True
 
     def aplicar_tema(self):

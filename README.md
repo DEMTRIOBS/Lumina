@@ -30,7 +30,17 @@ navegador ou da aula.
   folhas, sem linha cortada e sem título órfão no pé da folha; a *Rolagem
   contínua* emenda uma página na outra como um texto corrido.
 - **PDF e EPUB** — o EPUB passa pelo mesmo motor: capítulos, sumário, código,
-  figuras, grifos e progresso.
+  figuras, grifos e progresso. PDF com senha e páginas digitalizadas (OCR do
+  próprio Windows) também.
+- **Texto que flui** — sem buraco no fim de cada página e sem palavra partida
+  entre páginas; em janela larga, duas folhas lado a lado.
+- **Estudo com o VS Code ao lado** — o assistente lê o arquivo aberto no
+  editor e explica a página aplicada ao seu código; um clique manda o bloco
+  do livro para o VS Code.
+- **Revisão espaçada** dos grifos (como no Anki), estatísticas de leitura,
+  dicionário e tradução da seleção.
+- **IA à sua escolha** — Claude (Haiku, Sonnet, Opus), OpenAI, Gemini ou IA
+  local, com o modelo que couber no seu bolso.
 - **Figuras no lugar certo**, inclusive diagramas vetoriais; um clique abre em
   tamanho real.
 - **Código como num editor** — 14 linguagens com realce, numeração do PDF
@@ -58,10 +68,32 @@ navegador ou da aula.
 
 ## Baixar
 
-Baixe o **`Lumina.exe`** na página de
-[Releases](https://github.com/DEMTRIOBS/Lumina/releases/latest) — arquivo
-único, roda em Windows 10/11 sem instalar nada. Para abrir um PDF direto no
-Lumina, use **Abrir com → Lumina** no Explorador.
+Na página de [Releases](https://github.com/DEMTRIOBS/Lumina/releases/latest)
+há dois arquivos — escolha um:
+
+| Arquivo | Para quem |
+|---|---|
+| **`LuminaSetup-x.y.exe`** (instalador) | Recomendado. Instala só para o seu usuário, sem pedir senha de administrador, em `%LOCALAPPDATA%\Programs\Lumina`. Cria atalho no menu Iniciar (e, se quiser, na área de trabalho), aparece em **Abrir com** para PDF e EPUB e tem desinstalador em *Configurações → Aplicativos*. |
+| **`Lumina.exe`** (portátil) | Arquivo único, roda em Windows 10/11 sem instalar nada — bom para pendrive ou PC sem permissão de instalação. Para abrir um PDF nele, use **Abrir com → Escolher outro aplicativo**. |
+
+O instalador **não** troca o seu leitor de PDF padrão: o Lumina só entra na
+lista do *Abrir com* (e em *Configurações → Aplicativos padrão*, se você
+quiser escolhê-lo lá). Para EPUB há uma opção marcável na instalação.
+Biblioteca, grifos e notas ficam em `%APPDATA%\Lumina` nas duas versões, e
+desinstalar não apaga esses dados.
+
+**Atualizações:** uma vez por dia o Lumina consulta a página de Releases (uma
+requisição anônima ao GitHub, sem enviar dado nenhum) e, havendo versão nova,
+mostra um aviso com **Atualizar**. Ele baixa o arquivo certo para a sua cópia,
+fecha, troca e reabre sozinho. Dá para desligar ou procurar na hora em
+*Configurações → Sobre*.
+
+**Aviso do Windows (SmartScreen):** o Lumina é gratuito e o executável não tem
+assinatura digital paga, então na primeira execução o Windows pode mostrar
+*"O Windows protegeu o computador"*. Clique em **Mais informações** →
+**Executar assim mesmo**. O código-fonte inteiro está neste repositório e os
+dois arquivos são compilados pelo próprio GitHub Actions a partir dele
+(veja `.github/workflows/release.yml`).
 
 ## Rodar a partir do código
 

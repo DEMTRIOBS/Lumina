@@ -111,6 +111,28 @@ class _ProvedorHTTP(AIProvider):
         return self._call(pergunta)
 
 
+# Modelos oferecidos em Configuracoes > IA, do mais leve ao mais capaz.
+# O leve responde resumo, flashcard e pergunta sobre o livro muito bem e
+# custa uma fracao; o maior so compensa em raciocinio longo. Qualquer outro
+# nome pode ser digitado no campo "Outro" (fica em "modelo_<provedor>").
+MODELOS = {
+    "Claude": [
+        ("claude-haiku-5-5", "Haiku 5.5 — rapido e barato"),
+        ("claude-sonnet-5-5", "Sonnet 5.5 — equilibrio"),
+        ("claude-opus-5-5", "Opus 5.5 — o mais capaz"),
+    ],
+    "OpenAI": [
+        ("gpt-4o-mini", "GPT-4o mini — barato (aposenta em jan/2027)"),
+        ("gpt-6-luna", "GPT-6 Luna — sucessor indicado pela OpenAI"),
+    ],
+    "Gemini": [
+        ("gemini-flash-lite-latest", "Flash-Lite — o mais leve"),
+        ("gemini-flash-latest", "Flash — equilibrio"),
+        ("gemini-pro-latest", "Pro — o mais capaz"),
+    ],
+}
+
+
 class ClaudeProvider(_ProvedorHTTP):
     nome = "Claude"
 
@@ -128,21 +150,26 @@ class ClaudeProvider(_ProvedorHTTP):
         #   O tamanho da resposta fica a cargo do prompt e o esforco "low"
         #   mantem as tarefas curtas rapidas e baratas.
         # - temperatura nao e aceita nos modelos atuais (400).
-        resposta = requests.post(
-            self.url,
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": self.modelo,
-                "max_tokens": 8000,
-                "output_config": {"effort": "low"},
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=TEMPO_LIMITE,
-        )
+        corpo = {
+            "model": self.modelo,
+            "max_tokens": 8000,
+            "output_config": {"effort": "low"},
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        cabecalhos = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        resposta = requests.post(self.url, headers=cabecalhos, json=corpo,
+                                 timeout=TEMPO_LIMITE)
+        if resposta.status_code == 400 and "effort" in resposta.text:
+            # Modelo antigo digitado a mao (ex.: Haiku 4.5) nao conhece o
+            # "effort": tenta de novo sem ele em vez de falhar.
+            corpo.pop("output_config", None)
+            corpo["max_tokens"] = 4000
+            resposta = requests.post(self.url, headers=cabecalhos, json=corpo,
+                                     timeout=TEMPO_LIMITE)
         resposta.raise_for_status()
         dados = resposta.json()
         if dados.get("stop_reason") == "refusal":
@@ -170,7 +197,12 @@ class OpenAIProvider(_ProvedorHTTP):
             self.url,
             headers={"Authorization": f"Bearer {self.api_key}",
                      "Content-Type": "application/json"},
-            json={"model": self.modelo, "max_tokens": max(400, limite or 1400),
+            # max_completion_tokens: o campo atual da API (max_tokens e
+            # recusado pelos modelos com raciocinio). Nos que raciocinam o
+            # teto inclui o raciocinio, entao fica mais folgado.
+            json={"model": self.modelo,
+                  "max_completion_tokens": (max(400, limite or 1400)
+                                            if self.modelo.startswith("gpt-4") else 6000),
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=TEMPO_LIMITE,
         )
@@ -188,6 +220,7 @@ class GeminiProvider(_ProvedorHTTP):
     def __init__(self, api_key, modelo=None):
         self.api_key = api_key
         modelo = modelo or self.MODELO_PADRAO
+        self.modelo = modelo
         self.url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                     f"{modelo}:generateContent")
 

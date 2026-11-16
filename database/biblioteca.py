@@ -6,6 +6,7 @@ por interpolacao de string e reescrevia TODOS os grifos do livro a cada clique.
 Aqui cada operacao e granular, parametrizada e toca so a linha necessaria.
 """
 import os
+import sqlite3
 import time
 
 from database.sqlite_db import conexao
@@ -74,7 +75,7 @@ class BancoBiblioteca:
         with conexao() as conn:
             # Explicito: bancos vindos da v1 nao tem ON DELETE CASCADE nessas
             # tabelas, e re-adicionar o mesmo PDF ressuscitava notas antigas.
-            for tabela in ("grifos", "anotacoes", "favoritos"):
+            for tabela in ("grifos", "anotacoes", "favoritos", "senhas_livro"):
                 conn.execute(f"DELETE FROM {tabela} WHERE id_livro = ?", (id_livro,))
             conn.execute("DELETE FROM livros WHERE id_livro = ?", (id_livro,))
         if apagar_capa and livro and livro.get("caminho_capa"):
@@ -85,11 +86,67 @@ class BancoBiblioteca:
 
     def definir_pagina(self, id_livro, pagina):
         with conexao() as conn:
+            # Paginas lidas no dia (estatisticas): so avanco de 1 a 3 paginas
+            # conta como leitura; pulo pelo sumario ou volta nao conta.
+            anterior = conn.execute("SELECT pagina_atual FROM livros WHERE id_livro = ?",
+                                    (id_livro,)).fetchone()
+            if anterior is not None:
+                avanco = int(pagina) - int(anterior["pagina_atual"] or 0)
+                if 1 <= avanco <= self.AVANCO_MAXIMO_LIDO:
+                    self._somar_diario(conn, id_livro, 0, avanco)
             conn.execute(
                 # rolagem zera: o offset salvo era da pagina anterior.
                 "UPDATE livros SET pagina_atual = ?, rolagem = 0, "
                 "data_ultimo_acesso = ? WHERE id_livro = ?",
                 (int(pagina), time.strftime("%Y-%m-%d %H:%M:%S"), id_livro))
+
+    def marcar_como_lido(self, ids_livro) -> int:
+        """Leva o progresso a 100% (ultima pagina). Devolve quantos mudaram.
+
+        A estante nao tem um estado "lido" separado: o progresso e
+        pagina_atual / total_paginas, entao "lido" e estar na ultima pagina.
+        Livros sem contagem de paginas ficam de fora -- nao ha o que marcar.
+        """
+        ids = [str(i) for i in ids_livro]
+        if not ids:
+            return 0
+        with conexao() as conn:
+            cursor = conn.execute(f"""
+                UPDATE livros SET pagina_atual = total_paginas - 1, rolagem = 0
+                 WHERE total_paginas > 0
+                   AND id_livro IN ({','.join('?' * len(ids))})
+            """, ids)
+            return cursor.rowcount
+
+    # ------------------------------------------------------ senha de PDF
+    def definir_senha(self, id_livro, senha) -> bool:
+        """Lembra a senha cifrada com DPAPI. False se nao foi possivel cifrar
+        (fora do Windows): nesse caso nada e gravado."""
+        from database import cofre
+        cifrada = cofre.cifrar(senha)
+        if not cifrada:
+            return False
+        with conexao() as conn:
+            conn.execute("""
+                INSERT INTO senhas_livro (id_livro, senha_cifrada, criado_em)
+                VALUES (?, ?, ?)
+                ON CONFLICT(id_livro) DO UPDATE SET
+                    senha_cifrada = excluded.senha_cifrada,
+                    criado_em = excluded.criado_em
+            """, (id_livro, cifrada, time.strftime("%Y-%m-%d %H:%M:%S")))
+        return True
+
+    def obter_senha(self, id_livro):
+        """Senha em claro, ou None se nao houver ou nao der para decifrar."""
+        from database import cofre
+        with conexao() as conn:
+            linha = conn.execute("SELECT senha_cifrada FROM senhas_livro WHERE id_livro = ?",
+                                 (id_livro,)).fetchone()
+        return cofre.decifrar(linha["senha_cifrada"]) if linha else None
+
+    def remover_senha(self, id_livro):
+        with conexao() as conn:
+            conn.execute("DELETE FROM senhas_livro WHERE id_livro = ?", (id_livro,))
 
     def definir_rolagem(self, id_livro, offset):
         """Offset (em caracteres) do topo visivel da pagina atual."""
@@ -188,6 +245,40 @@ class BancoBiblioteca:
             conn.execute(
                 "UPDATE livros SET segundos_lidos = COALESCE(segundos_lidos, 0) + ? "
                 "WHERE id_livro = ?", (int(segundos), id_livro))
+            self._somar_diario(conn, id_livro, int(segundos), 0)
+
+    # ------------------------------------------------------- diario de leitura
+    # O total em `livros.segundos_lidos` continua sendo a fonte do cartao do
+    # livro; `leitura_diaria` e o mesmo tempo quebrado por dia, para as
+    # estatisticas (services/revisao.py).
+    AVANCO_MAXIMO_LIDO = 3
+
+    @staticmethod
+    def _somar_diario(conn, id_livro, segundos=0, paginas=0, data=None):
+        if not id_livro or (segundos <= 0 and paginas <= 0):
+            return
+        try:
+            conn.execute("""
+                INSERT INTO leitura_diaria (data, id_livro, segundos, paginas)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(data, id_livro) DO UPDATE SET
+                    segundos = segundos + excluded.segundos,
+                    paginas  = paginas + excluded.paginas
+            """, (data or time.strftime("%Y-%m-%d"), id_livro, max(0, int(segundos)),
+                  max(0, int(paginas))))
+        except sqlite3.Error:
+            # Estatistica e acessorio: nunca pode derrubar a gravacao da
+            # pagina ou do tempo, que estao na mesma transacao.
+            pass
+
+    def registrar_leitura_diaria(self, id_livro, segundos=0, paginas=0, data=None):
+        """Soma tempo/paginas no dia (data 'AAAA-MM-DD'; padrao = hoje).
+
+        Nao mexe em `livros.segundos_lidos` -- use somar_tempo_leitura para o
+        tempo de sessao, que ja registra aqui tambem.
+        """
+        with conexao() as conn:
+            self._somar_diario(conn, id_livro, segundos, paginas, data)
 
     # ---------------------------------------------------------------- favoritos
     def categorias_em_uso(self):
