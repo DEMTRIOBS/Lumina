@@ -1,0 +1,5 @@
+# Dependencias para rodar o Lumina (python main.py)
+customtkinter==6.0.0
+pymupdf==1.28.0
+pillow==12.3.0
+requests==2.34.2

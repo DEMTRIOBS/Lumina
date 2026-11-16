@@ -1,0 +1,4 @@
+# Para compilar o executavel e checar o codigo
+-r requirements.txt
+pyinstaller==6.21.0
+pyflakes==4.1.0

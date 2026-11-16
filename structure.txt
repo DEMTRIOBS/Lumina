@@ -1,0 +1,251 @@
+LUMINA 2.0 — mapa da arquitetura
+================================
+
+meu_leitor_pdf/
+│
+├── main.py                 Casca do app: splash, tema, atalhos globais e todo o
+│                           controle de janela para tela dividida (encaixe,
+│                           modo coluna, sempre-no-topo, opacidade).
+├── configuracoes.py        Design tokens (cores, espacamento, raio), temas e
+│                           caminhos. O objeto `T` e o tema ativo.
+├── build.py                Gera icone + splash e chama o PyInstaller.
+├── leitor.spec             Receita do executavel.
+│
+├── core/
+│   ├── paths.py            resource_path() para recursos do bundle e
+│   │                       user_path() para dados em %APPDATA%. E o que faz o
+│   │                       .exe nao perder a biblioteca a cada execucao.
+│   └── branding.py         Rasteriza minha_logo.svg no tamanho pedido e monta
+│                           o app.ico multi-resolucao.
+│
+├── database/
+│   ├── sqlite_db.py        Esquema, WAL, migracoes por ALTER e importacao dos
+│   │                       JSONs da versao 1.
+│   ├── biblioteca.py       CRUD granular de livros, grifos, notas, marcadores.
+│   ├── pastas.py           Pastas hierarquicas (id_pai apontando para si
+│   │                       mesma) com consultas recursivas para descendentes,
+│   │                       trilha e contagem.
+│   └── config.py           Preferencias globais com cache em memoria.
+│
+├── services/
+│   ├── pdf_service.py      Identidade por conteudo, metadados, capa e busca no
+│   │                       livro inteiro.
+│   ├── reflow.py           MOTOR DE REFLOW: mede o corpo tipografico, remove
+│   │                       cabecalho/rodape recorrente, ordena colunas, junta
+│   │                       linhas em paragrafos, desfaz hifenizacao,
+│   │                       classifica titulo/lista/citacao/codigo/nota e
+│   │                       INTERCALA AS FIGURAS na ordem de leitura.
+│   ├── perfil.py           Pipeline de detectores -> um PerfilLivro. Cada
+│   │                       detector e opcional e alimenta os paineis extras.
+│   ├── figuras.py          Catalogo de ilustracoes para o painel Figuras.
+│   ├── quadros.py          Deteccao de quadros de HQ por projecao de brancos.
+│   ├── exportar.py         Grifos, notas e marcadores -> Markdown (Ctrl+E),
+│   │                       agrupados por capitulo do sumario.
+│   ├── realce.py           Tokenizacao e realce de sintaxe (14 linguagens).
+│   ├── codigo_util.py      Numeracao de linhas, dobra e copia limpa de codigo.
+│   ├── deteccao_academico.py / deteccao_juridico.py
+│   │                       Citacoes, referencias, versiculos, artigos e datas.
+│   ├── contexto.py         Motor de contexto local (janela ao lado -> perfil).
+│   ├── indice.py           INDICE DE BLOCOS do livro: parte em trechos de
+│   │                       300-700 chars, TF-IDF com reranker por cobertura,
+│   │                       confianca ABSOLUTA e cache .lumina em %APPDATA%.
+│   ├── tela.py             Le o TEXTO da janela ao lado pela arvore de
+│   │                       acessibilidade do Windows (UI Automation com
+│   │                       ctypes cru). Sem OCR, sem capturar imagem.
+│   └── voz.py              Narracao pelo SAPI do Windows, com ganho acima de
+│                           100% e sintese fora da thread da interface.
+│
+├── ui/
+│   ├── componentes.py      Widgets reutilizaveis + registro de estilo que
+│   │                       repinta o app inteiro na troca de tema. Tooltip,
+│   │                       Toast, botoes, campos, modais.
+│   ├── estante.py          Biblioteca: arvore de pastas, trilha de navegacao,
+│   │                       cartoes de pasta e de livro, filtro global,
+│   │                       ordenacao, cabecalho e barra lateral responsivos.
+│   ├── leitor.py           Tela de leitura: coluna com largura maxima em
+│   │                       caracteres, 4 modos de virada de pagina (livre,
+│   │                       setas flutuantes, clique na margem, rolagem
+│   │                       automatica), painel lateral (sumario/busca/
+│   │                       marcadores/notas), painel de IA, barra flutuante de
+│   │                       selecao, modo foco e popover de tipografia.
+│   └── modais.py           Notas, zoom de imagem, confirmacao, prompt de texto,
+│                           escolha de pasta, menus de livro e de pasta,
+│                           configuracoes (IA, atalhos, sobre).
+│
+└── ia/
+    ├── provider.py         Contrato comum (summarize/keywords/flashcards/
+    │                       explain/ask_question/classificar).
+    ├── providers.py        Claude, OpenAI, Gemini, Ollama e qualquer servidor
+    │                       local no dialeto da OpenAI -- tudo por HTTP puro.
+    ├── roteador.py         QUEM RESPONDE: roteia livro/IA/hibrido por regras,
+    │                       aplica o Guardiao (limiares de confianca) e o
+    │                       Verificador (identificador citado tem que estar
+    │                       nos trechos). O modelo redige, nunca pesquisa.
+    ├── local.py            IA LOCAL AUTOMATICA: procura servidor ja aberto na
+    │                       maquina, escolhe o MENOR modelo dele e, se nao
+    │                       houver nenhum, baixa e administra o proprio
+    │                       llama-server em %APPDATA%.
+    ├── offline.py          Analise local: resumo por frequencia, bigramas,
+    │                       flashcards por definicao e busca extrativa.
+    └── manager.py          Fila com fallback em cascata entre provedores.
+
+
+ONDE FICAM OS DADOS DO USUARIO
+------------------------------
+%APPDATA%\Lumina\
+    meu_leitor.db     biblioteca, progresso, grifos, notas, marcadores
+    capas_cache\      miniaturas das capas
+    app.ico           icone gerado do SVG
+
+Rodando pelo codigo-fonte ou pelo .exe, o caminho e o mesmo — atualizar o
+executavel nunca apaga a estante.
+
+
+DECISOES QUE VALE LEMBRAR
+-------------------------
+1. Grifos guardam DESLOCAMENTO DE CARACTERE, nao indice do widget Tk. Por isso
+   sobrevivem a troca de fonte, de tamanho e de largura de janela.
+
+2. Imagens ocupam uma marca de 1 caractere no texto antes de serem inseridas,
+   mantendo o alinhamento entre deslocamento salvo e indice do widget.
+
+3. `CTkFrame.bind` registra o evento no canvas interno: comparar
+   `evento.widget` com o proprio frame desliga o handler.
+
+4. `CTk.geometry()` multiplica LARGURA e ALTURA pelo fator de DPI, mas nao X e
+   Y. Todo posicionamento trabalha em pixels fisicos e converte no fim.
+
+5. Uma janela em estado `withdrawn` ignora redimensionamento. Como o
+   CustomTkinter faz seu proprio withdraw/deiconify para pintar a barra de
+   titulo, a geometria so pode ser aplicada depois disso.
+
+6. Modais nao usam `grab_set()`. Combinado com o withdraw/deiconify acima, o
+   grab travava o aplicativo inteiro com a janela escondida atras. Hoje usam
+   `transient()`: o pior caso vira um modal atras, nunca um app congelado.
+
+7. Pasta e EXCLUSIVA (um livro, um lugar) e a exclusao usa SET NULL nos livros
+   -- apagar organizacao nunca apaga acervo.
+
+8. O fim da pagina e detectado encadeando o `yscrollcommand` do Text (que segue
+   alimentando a barra do CustomTkinter). E exato e sem custo; perguntar a
+   posicao num temporizador seria impreciso e desperdicio.
+
+9. A rolagem automatica acumula a FRACAO de pixel entre quadros. Sem isso as
+   velocidades baixas arredondam para zero e a pagina nunca sai do lugar.
+
+10. `place()` do CustomTkinter MULTIPLICA x e y pelo fator de escala de tela,
+    mas `winfo_width()` e `Text.bbox()` devolvem pixel real. Misturar os dois
+    joga o widget 25% fora do lugar numa tela a 125%. O mesmo vale para
+    `LARGURA_CARTAO` na conta de colunas da estante. Sempre dividir pela
+    escala antes de posicionar.
+
+11. `get_text("dict")` sem `TEXT_PRESERVE_IMAGES` nao omite so os pixels: ele
+    omite o BLOCO DE IMAGEM inteiro. A geometria das figuras vem de
+    `get_image_info()`, que e a consulta barata.
+
+12. Toda figura e RASTERIZADA da regiao da pagina, e nao lida dos bytes
+    embutidos. Resolve de uma vez transparencia com mascara, figura fatiada em
+    varios XObjects, rotulo escrito por cima do grafico e desenho vetorial --
+    que nem bytes tem.
+
+13. PDF gerado de EPUB entrega cada PALAVRA de uma linha justificada como uma
+    "linha" propria. Sem junta-las antes de analisar, a regra de recuo de
+    paragrafo dispara em cada palavra e o capitulo sai picado.
+
+14. Sintetizar voz e bloqueante e demorado (minutos numa pagina). Roda em
+    thread; o resultado e descartado se a geracao mudou -- senao a pagina
+    anterior comecaria a falar depois do "parar".
+
+15. A IA local roda como PROCESSO (llama-server falando HTTP), nao como
+    biblioteca. `llama-cpp-python` traria binarios nativos para dentro do
+    PyInstaller, que e onde empacotamento quebra; o executavel segue com
+    39 MB e o modelo mora em %APPDATA%. Mesmo padrao da sintese de voz.
+
+16. Modelo pequeno responde de uma palavra so quando o teto de tokens diz
+    isso. Sem `max_tokens=12` na classificacao, o modelo escrevia dois
+    paragrafos justificando a escolha: 20 s no lugar de 0,2 s.
+
+17. Sondar as portas dos servidores locais e subir o proprio motor custam
+    segundos. A descoberta e feita uma vez e vale por dois minutos -- curto o
+    bastante para o usuario abrir o LM Studio no meio da sessao e ser notado.
+
+18. O nivel 4 do motor de contexto (palpite do modelo no empate) precisa de um
+    limiar de confianca PROPRIO, mais baixo. Um desempate sai de dois
+    candidatos proximos e por definicao nunca alcanca os 55% das regras: com o
+    limiar unico, ele rodava e a sugestao nunca chegava a aparecer.
+
+19. A analise pesada do contexto (amostrar cores ~100 ms + modelo ~200 ms)
+    roda em thread. Na do Tk, a cada 2,5 s, seria mais de um segundo de janela
+    congelada por volta do monitor.
+
+20. UI Automation e COM, e COM e POR THREAD. O objeto criado na thread da
+    interface nao serve na thread de analise -- por isso `tela.py` guarda a
+    instancia num `threading.local` e chama CoInitializeEx em cada uma.
+
+21. Filtrar a arvore por TIPO de elemento (Text/Edit/Document) custa 20-240 ms;
+    varre-la inteira custa 900-2000 ms. A varredura completa traz um pouco mais
+    (o corpo do editor de codigo), mas nao vale dois segundos: o titulo da
+    janela ja carrega o nome do arquivo aberto.
+
+22. A classificacao pelo conteudo da tela roda ANTES do `if not pontos`. O caso
+    que mais precisa dela e o que nao pontua em regra nenhuma (navegador com
+    titulo generico); depois do desistir, o unico sinal bom era descartado
+    justamente na situacao que o justificava.
+
+23. O indice devolve confianca ABSOLUTA, nao relativa ao melhor resultado.
+    Normalizar pelo maximo dava 1,00 ao primeiro colocado sempre -- inclusive
+    quando o livro nao falava do assunto -- e o Guardiao liberava a redacao em
+    cima de trecho irrelevante. A nota mede quanto da PERGUNTA foi coberta;
+    termo ausente do livro inteiro entra no denominador com peso maximo.
+
+24. O verificador de saida precisa de uma lista de vocabulario tecnico comum.
+    Sem ela reprovava resposta boa: uma explicacao correta sobre templates foi
+    descartada por citar "JavaScript". Ele existe para pegar classe inventada,
+    nao para proibir o modelo de nomear a linguagem de que o livro trata.
+
+25. Modelo pequeno ignora "responda em 6 linhas" escrito no prompt. O unico
+    teto que ele respeita e o parametro de tokens: 34 s viraram 11 s.
+
+26. `ask_question` com texto VAZIO faz o modelo responder que nao entendeu o
+    texto fornecido -- e ele esta certo. Conhecimento geral precisa de uma
+    chamada propria (`general_question`), com outra pergunta ao modelo.
+
+27. A busca do Ctrl+F e a do assistente sao a MESMA. Ter duas fazia metade do
+    que o livro sabe ficar inacessivel pelo caminho que todo mundo usa.
+
+28. A expansao de busca precisa de uma ponte PALAVRA COMUM -> CONCEITO, e nao
+    so conceito -> conceito. Quem escreve "consulta no banco" nao sabe que o
+    livro chama aquilo de QuerySet -- e e justamente quem mais precisa da
+    expansao.
+
+29. A conversa herda o ASSUNTO, nao a pergunta anterior inteira. Acumular a
+    frase toda diluia a cobertura e derrubava a confianca de 1,00 para 0,55 em
+    duas trocas.
+
+30. Conceito NAO e "qualquer identificador importante". O indice classifica
+    cada token em especie -- conceito, framework, simbolo, arquivo, projeto,
+    pessoa -- e so conceito e framework participam da expansao por assunto.
+    O sintoma que revelou isso: buscar "consulta no banco" trazia tiago_luiz
+    e livro_django, o usuario e o diretorio do exemplo do autor.
+
+31. O sinal que separa as especies e o CONTEXTO DE CAMINHO, contado dos dois
+    lados. Medido: ForeignKey/QuerySet 0%, livro_django 88%, medicSearch 79%,
+    tiago_luiz 100%. Olhar so a esquerda perdia tiago_luiz, cujo @ vem depois.
+
+32. Palavra capitalizada so e nome proprio se quase nunca aparecer minuscula
+    NO LIVRO INTEIRO. Contar minusculas apenas nos blocos onde a versao
+    capitalizada apareceu nao ve nada: "Vamos" tem 1 maiuscula por bloco e 0
+    minusculas ali, e so a contagem global revela as centenas de "vamos".
+
+33. Densidade = numero de PAGINAS distintas, nao distancia entre a primeira e
+    a ultima. A versao que pesava a distancia dava 0,66 para "Deus" -- duas
+    aparicoes, agradecimentos e ultima pagina -- e o colocava no mapa de
+    conceitos do livro de Django.
+
+34. PORT, PASSWORD e HOST chegam a ser classificados como conceito porque sao
+    ALL_CAPS num dicionario de configuracao. Separa-los de API, ORM e TDD
+    exigiria um PAPEL alem do tipo; hoje quem os segura e a densidade.
+
+35. O tamanho do modelo local e escolha do usuario, com a RAM livre medida na
+    hora. Nao ha resposta unica: como o modelo so REDIGE o que o indice achou,
+    subir de 0,5B para 1B melhora a redacao e o modo geral, nao a busca.

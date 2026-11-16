@@ -1,0 +1,33 @@
+# --- Ambiente e build
+venv/
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec.bak
+
+# --- Gerados pelo build.py (refeitos a cada compilacao)
+app.ico
+splash.png
+
+# --- DADOS PESSOAIS: nunca versionar
+# Biblioteca, progresso, grifos e notas do usuario.
+*.db
+*.db-wal
+*.db-shm
+capas_cache/
+progresso.json
+biblioteca.json
+config.json
+# Backups da v1 -- config.json.bkp guarda CHAVES DE API.
+*.bkp
+
+# --- Sistema e locais
+Thumbs.db
+desktop.ini
+.DS_Store
+_backup_*/
+.claude/
+.vscode/
+.idea/
