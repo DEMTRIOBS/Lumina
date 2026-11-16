@@ -24,9 +24,16 @@ from configuracoes import (APP_NOME, APP_VERSAO, CATEGORIAS, ESP, FONTE_UI,
                            adivinhar_categoria)
 from core.branding import carregar_logo
 from database.pastas import SOLTOS, TODOS
+from services.pdf_service import TIPOS_ARQUIVO
 from ui.modais import Modais
 
 LARGURA_CARTAO = 178
+
+
+def _rotulo_formato(livro):
+    """O que a capa provisoria mostra enquanto nao ha imagem: o formato."""
+    caminho = str((livro or {}).get("caminho_pdf") or "").lower()
+    return "EPUB" if caminho.endswith(".epub") else "PDF"
 ALTURA_CAPA = 208
 LARGURA_BARRA = 214
 ORDENACOES = ["Recentes", "Titulo", "Progresso", "Adicionados"]
@@ -159,10 +166,10 @@ class TelaEstante(ctk.CTkFrame):
 
         C.botao_icone(acoes, "config", self._abrir_configuracoes,
                       "Configuracoes e assistente de IA").grid(row=0, column=1, padx=2)
-        self.btn_adicionar = C.botao(acoes, "Adicionar PDF", self.adicionar_livros,
+        self.btn_adicionar = C.botao(acoes, "Adicionar livro", self.adicionar_livros,
                                      largura=140, icone="＋")
         self.btn_adicionar.grid(row=0, column=2, padx=(ESP["sm"], 0))
-        C.Tooltip(self.btn_adicionar, "Adicionar um ou mais PDFs a pasta aberta")
+        C.Tooltip(self.btn_adicionar, "Adicionar um ou mais livros (PDF ou EPUB) a pasta aberta")
 
     # ---------------------------------------------------------- barra lateral
     def _construir_barra_pastas(self, pai):
@@ -528,7 +535,7 @@ class TelaEstante(ctk.CTkFrame):
         if miniatura is not None:
             capa = ctk.CTkLabel(caixa, text="", image=miniatura, cursor="hand2")
         else:
-            capa = ctk.CTkLabel(caixa, text="PDF", width=LARGURA_MINIATURA,
+            capa = ctk.CTkLabel(caixa, text=_rotulo_formato(livro), width=LARGURA_MINIATURA,
                                 height=ALTURA_MINIATURA, fg_color=T.superficie_alt,
                                 corner_radius=RAIO["sm"], cursor="hand2",
                                 text_color=T.texto_suave,
@@ -627,8 +634,8 @@ class TelaEstante(ctk.CTkFrame):
             nome = (self.pastas.obter(self.pasta_atual) or {}).get("nome", "esta pasta")
             self._estado_vazio(
                 "pasta", f"“{nome}” esta vazia",
-                "Adicione PDFs direto aqui ou crie subpastas\npara separar por materia.",
-                "Adicionar PDF nesta pasta", self.adicionar_livros)
+                "Adicione PDFs e EPUBs direto aqui ou crie subpastas\npara separar por materia.",
+                "Adicionar livro nesta pasta", self.adicionar_livros)
         elif self.pasta_atual == SOLTOS:
             self._estado_vazio("confirmado", "Nenhum livro solto",
                                "Todos os seus livros ja estao organizados em pastas.",
@@ -636,9 +643,9 @@ class TelaEstante(ctk.CTkFrame):
         else:
             self._estado_vazio(
                 "biblioteca", "Sua biblioteca esta vazia",
-                "Adicione um PDF e ele vira um livro refluido, pronto para ler\n"
+                "Adicione um PDF ou EPUB e ele vira um livro refluido, pronto para ler\n"
                 "em meia tela ao lado das suas outras janelas.",
-                "Adicionar primeiro PDF", self.adicionar_livros)
+                "Adicionar primeiro livro", self.adicionar_livros)
         self.rodape.configure(text="")
 
     def _estado_vazio(self, icone, titulo, descricao, texto_botao, comando):
@@ -762,7 +769,7 @@ class TelaEstante(ctk.CTkFrame):
             widget_capa = ctk.CTkLabel(cartao, text="", image=capa, cursor="hand2")
         else:
             widget_capa = ctk.CTkLabel(
-                cartao, text="PDF", width=LARGURA_CARTAO - 24, height=ALTURA_CAPA,
+                cartao, text=_rotulo_formato(livro), width=LARGURA_CARTAO - 24, height=ALTURA_CAPA,
                 fg_color=T.superficie_alt, corner_radius=RAIO["sm"], cursor="hand2",
                 text_color=T.texto_suave, font=ctk.CTkFont(FONTE_UI, 22, "bold"))
             C.registrar_estilo(widget_capa, fg_color="superficie_alt", text_color="texto_suave")
@@ -1044,7 +1051,7 @@ class TelaEstante(ctk.CTkFrame):
             novo = filedialog.askopenfilename(
                 parent=self.winfo_toplevel(),
                 title=f"Localizar “{livro.get('titulo')}”",
-                filetypes=[("Arquivos PDF", "*.pdf")])
+                filetypes=TIPOS_ARQUIVO)
             if not novo:
                 return
 
@@ -1066,21 +1073,21 @@ class TelaEstante(ctk.CTkFrame):
             else:
                 Modais.confirmar(
                     self, "Arquivo diferente",
-                    "Este PDF nao e identico ao original (outra edicao ou "
+                    "Este arquivo nao e identico ao original (outra edicao ou "
                     "arquivo modificado).\n\nGrifos e marcacoes podem cair em "
                     "lugares errados. Usar mesmo assim?",
                     texto_ok="Usar este arquivo", ao_confirmar=aplicar)
 
         Modais.confirmar(
             self, "Arquivo nao encontrado",
-            f"O PDF de “{livro.get('titulo')}” nao esta mais em:\n\n"
+            f"O arquivo de “{livro.get('titulo')}” nao esta mais em:\n\n"
             f"{livro.get('caminho_pdf')}\n\n"
             "Voce pode apontar o novo local do arquivo sem perder grifos e notas.",
             texto_ok="Localizar arquivo", ao_confirmar=relocalizar)
 
     def adicionar_livros(self):
         caminhos = filedialog.askopenfilenames(
-            parent=self.winfo_toplevel(), title="Escolher PDFs", filetypes=[("Arquivos PDF", "*.pdf")])
+            parent=self.winfo_toplevel(), title="Escolher livros (PDF ou EPUB)", filetypes=TIPOS_ARQUIVO)
         if not caminhos:
             return
 
@@ -1187,7 +1194,7 @@ class TelaEstante(ctk.CTkFrame):
         Modais.confirmar(
             self, "Remover da biblioteca",
             f"“{livro.get('titulo')}” sai da estante junto com seus grifos, "
-            "marcadores e anotacoes.\n\nO arquivo PDF original nao e apagado do disco.",
+            "marcadores e anotacoes.\n\nO arquivo original nao e apagado do disco.",
             texto_ok="Remover", perigo=True, ao_confirmar=confirmar)
 
     def _abrir_configuracoes(self):
@@ -1251,7 +1258,7 @@ class TelaEstante(ctk.CTkFrame):
         else:
             self.lbl_marca.pack(side="left")
             self.seletor_ordem.grid()
-            self.btn_adicionar.configure(text="＋  Adicionar PDF", width=140)
+            self.btn_adicionar.configure(text="＋  Adicionar livro", width=150)
             self.entry_filtro.configure(placeholder_text="Filtrar por titulo ou autor…")
             self.faixa_trilha.grid()
         # Quem decide entre arvore, botao de reabrir e nada e um lugar so --

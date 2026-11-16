@@ -909,7 +909,7 @@ class MotorReflow:
             resultado.digitalizada = True
             resultado.blocos.append(Bloco(
                 "aviso",
-                "Pagina sem camada de texto (digitalizada). Exibindo imagem original."
+                "Pagina sem texto selecionavel (imagem ou digitalizacao). Exibindo o original."
             ))
             imagem = self._renderizar_pagina(pagina)
             if imagem:

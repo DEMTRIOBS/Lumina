@@ -20,7 +20,6 @@ import tkinter.font as tkfont
 from tkinter import filedialog
 
 import customtkinter as ctk
-import fitz
 from PIL import Image, ImageTk
 
 import ui.componentes as C
@@ -28,7 +27,8 @@ import ui.icones as icones
 from configuracoes import (ALTURA_LINHA_PADRAO, APP_NOME, ESP, FONTE_UI,
                            FONTES_LEITURA, INTERVALO_ROLAGEM_MS,
                            LARGURA_COLUNA_MAX, LARGURA_COLUNA_MIN,
-                           LIMIAR_COMPACTO, MODO_AUTO, MODO_BOTOES, MODO_LIVRE,
+                           LIMIAR_COMPACTO, MODO_AUTO, MODO_BOTOES, MODO_FOLHA,
+                           MODO_LIVRE, normalizar_modo_virada,
                            MODO_MARGEM, MODO_VIRADA_PADRAO, MODOS_VIRADA,
                            PALAVRAS_POR_MINUTO, PAUSA_FIM_PAGINA_MS, RAIO, T,
                            CATEGORIAS, RENDERIZACOES, RENDER_PADRAO,
@@ -47,6 +47,7 @@ import services.exportar as exportar
 import services.realce as realce
 import services.tela as tela
 import services.voz as voz
+from services.pdf_service import abrir as abrir_livro
 from services.reflow import Bloco, MotorReflow
 from ui.modais import Modais
 
@@ -185,6 +186,17 @@ class TelaLeitor(ctk.CTkFrame):
         self._agendado_layout = None
         self._agendado_selecao = None
         self._acumulado_wheel = 0
+        self._chegou_ao_limite = 0.0
+        self._ultima_folha = 0.0
+        self._limite_visto = False
+        self._grade_folhas = []
+        self._altura_da_grade = None
+        self._folga_folha = 0
+        self._folha_atual = 0
+        self._simulando = False
+        self._agendado_folha = None
+        self._mascara = None
+        self._entrar_pelo_fim = False
         self._estado_setas = None
         self._rolagem_ativa = False
         self._id_rolagem = None
@@ -1003,6 +1015,18 @@ class TelaLeitor(ctk.CTkFrame):
             self.update_idletasks()
         self.txt.yview_moveto(posicao)
         self._acumulado_wheel = 0
+        self._grade_folhas = []
+        if self._em_folha():
+            entrada = "fim" if self._entrar_pelo_fim else (
+                self.txt.index("@0,4") if posicao else None)
+            self._entrar_pelo_fim = False
+            self._montar_folhas(manter_indice=entrada)
+        elif self._entrar_pelo_fim:
+            # `see` mede de verdade; yview_moveto(1.0) usa a ALTURA ESTIMADA
+            # da pagina e as vezes parava a dois tercos dela.
+            self._entrar_pelo_fim = False
+            self.update_idletasks()
+            self.txt.see("end-1c")
 
         self._atualizar_rodape()
         self._atualizar_estado_botoes()
@@ -1112,7 +1136,7 @@ class TelaLeitor(ctk.CTkFrame):
             try:
                 # Documento proprio: o fitz.Document nao e seguro para uso
                 # simultaneo em duas threads, e a interface segue lendo o dela.
-                with fitz.open(caminho) as copia:
+                with abrir_livro(caminho) as copia:
                     achados = quadros.detectar_quadros(copia, numero)
             except Exception as erro:
                 print(f"[Quadros] Falha na deteccao: {erro}")
@@ -1383,6 +1407,11 @@ class TelaLeitor(ctk.CTkFrame):
         alguns pixels: a ultima palavra de cada linha justificada nao cabia
         mais e descia sozinha para uma linha propria.
         """
+        if self._em_folha() and evento is not None:
+            altura = self.txt.winfo_height()
+            if altura != getattr(self, "_altura_folhas", None):
+                self._altura_folhas = altura
+                self._agendar_realinhar_folha()
         if (self._largura_justificada is None or not self.documento
                 or not self.cfg.obter_bool("justificar", True)):
             return
@@ -1714,6 +1743,21 @@ class TelaLeitor(ctk.CTkFrame):
             return
         self.ir_para_pagina(self.pagina_atual - 1)
 
+    def _avancar(self, direcao):
+        """Setas do teclado: folha no modo Folhear, pagina nos demais."""
+        if self._em_folha() and not self.quadro_a_quadro:
+            self._virar_folha(direcao)
+        elif direcao > 0:
+            self.proxima_pagina()
+        else:
+            self.pagina_anterior()
+
+    def _seta_vertical(self, direcao):
+        if self._em_folha():
+            self._virar_folha(direcao)
+        else:
+            self.txt.yview_scroll(direcao * 3, "units")
+
     def _ir_pelo_campo(self):
         valor = self.entry_ir.get().strip()
         if valor.isdigit():
@@ -1730,12 +1774,19 @@ class TelaLeitor(ctk.CTkFrame):
     # ===================================================== MODOS DE VIRADA
     @property
     def modo_virada(self):
-        modo = self.cfg.obter("modo_virada", MODO_VIRADA_PADRAO)
-        return modo if modo in MODOS_VIRADA else MODO_VIRADA_PADRAO
+        return normalizar_modo_virada(
+            self.cfg.obter("modo_virada", MODO_VIRADA_PADRAO))
 
     def aplicar_modo_virada(self):
         """Reconfigura os controles quando o modo muda."""
         modo = self.modo_virada
+        self._mostrar_barra_rolagem(modo != MODO_FOLHA)
+        if modo == MODO_FOLHA:
+            self.after_idle(self._montar_folhas)
+        else:
+            self._esconder_mascara()
+            self._remover_folga_final()
+            self._grade_folhas = []
         if modo != MODO_AUTO:
             self.parar_rolagem()
             self.painel_auto.place_forget()
@@ -1748,12 +1799,323 @@ class TelaLeitor(ctk.CTkFrame):
         self._atualizar_setas()
         self.txt.configure(cursor="arrow")
 
+    # ========================================================== FOLHEAR
+    # O texto cabe na tela e vira por folhas, como num livro. A pagina do PDF
+    # continua sendo a unidade de progresso; dentro dela, a "grade" guarda em
+    # que CARACTERE cada folha comeca. A folha seguinte comeca exatamente na
+    # primeira linha que nao coube inteira -- nada se perde entre folhas, e
+    # nada aparece pela metade: a mascara da cor do papel cobre a linha
+    # cortada no pe da folha.
+    #
+    # Por que caractere e nao pixel: a justificacao troca espacos por quebras
+    # e refaz a pagina sempre que a largura muda (a barra de rolagem some, a
+    # janela encolhe). Pixels medidos antes disso ficavam velhos e a folha 2
+    # repetia o fim da folha 1; o caractere aponta sempre para a mesma frase.
+    def _em_folha(self):
+        return self.modo_virada == MODO_FOLHA and self.documento is not None
+
+    def _mostrar_barra_rolagem(self, mostrar):
+        area = self.area
+        try:
+            if mostrar and not area._scrollbars_activated:
+                area._scrollbars_activated = True
+                area._check_if_scrollbars_needed()
+            elif not mostrar:
+                area._scrollbars_activated = False
+                area._y_scrollbar.grid_forget()
+        except Exception:
+            pass
+
+    def _limites_visiveis(self):
+        t = self.txt
+        try:
+            borda = int(float(t.cget("borderwidth"))) + int(float(t.cget("highlightthickness")))
+            pady = int(float(str(t.cget("pady"))))
+        except Exception:
+            borda, pady = 0, 0
+        topo = borda + pady
+        return topo, max(topo + 20, t.winfo_height() - borda - pady)
+
+    def _fim_visivel(self):
+        """O fim da pagina esta inteiro na tela? Medido, nao estimado.
+
+        As fracoes do yview sao ESTIMATIVAS enquanto o Tk mede as linhas em
+        segundo plano: 0.97 com o fim ja visivel, ou 1.0 sem ele estar.
+        """
+        _topo, base = self._limites_visiveis()
+        ultimo = self._ultimo_conteudo()
+        info = self.txt.dlineinfo(ultimo)
+        return bool(info) and info[1] + self._altura_da_linha(ultimo) <= base + 1
+
+    def _ypx(self, a, b):
+        valor = self.txt.count(a, b, "update", "ypixels")
+        if isinstance(valor, tuple):
+            valor = valor[-1]
+        return int(valor or 0)
+
+    def _altura_da_linha(self, indice):
+        """Altura INTEIRA da linha de exibicao que contem `indice`.
+
+        O dlineinfo do Tk devolve so a parte VISIVEL de uma linha cortada no
+        pe da tela (22 px de uma linha de 38) -- com ele, a linha cortada
+        parecia caber inteira e a mascara nunca aparecia.
+        """
+        inicio = self.txt.index(f"{indice} display linestart")
+        seguinte = self.txt.index(f"{inicio} +1 display lines display linestart")
+        altura = self._ypx(inicio, seguinte if self.txt.compare(seguinte, ">", inicio)
+                           else "end")
+        # A folga do Folhear mora na ultima linha; ela nao e conteudo.
+        if (self._em_folha() and self._folga_folha
+                and self.txt.compare(f"{inicio} display lineend", ">=", "end-1c")):
+            altura -= self._folga_folha
+        return altura
+
+    def _ultimo_conteudo(self):
+        """Ultimo caractere que nao e quebra de linha (figura conta)."""
+        indice = self.txt.index("end-1c")
+        for _ in range(8):
+            if self.txt.get(indice) != "\n" or not self.txt.compare(indice, ">", "1.0"):
+                break
+            indice = self.txt.index(f"{indice} -1c")
+        return indice
+
+    def _linha_cortada_no_pe(self):
+        """(indice, y) da linha que nao cabe inteira no pe da tela, ou None."""
+        topo, base = self._limites_visiveis()
+        ultima = self.txt.index(f"@0,{base - 1}")
+        info = self.txt.dlineinfo(ultima)
+        if (info and info[1] > topo + 1
+                and info[1] + self._altura_da_linha(ultima) > base + 1):
+            return self.txt.index(f"{ultima} display linestart"), info[1]
+        return None
+
+    def _inicio_visivel(self):
+        topo, _base = self._limites_visiveis()
+        info = self.txt.dlineinfo("1.0")
+        return bool(info) and info[1] >= topo - 1
+
+    def _offset_no_topo(self):
+        topo, _base = self._limites_visiveis()
+        return self._para_offset(self.txt.index(f"@0,{topo + 1}"))
+
+    def _inicio_da_proxima_folha(self):
+        """Indice da primeira linha que nao coube inteira na tela."""
+        cortada = self._linha_cortada_no_pe()
+        if cortada:
+            inicio = cortada[0]
+        else:
+            # Coube inteira (ou e uma linha/figura mais alta que a tela): a
+            # proxima folha comeca na linha de exibicao seguinte.
+            _topo, base = self._limites_visiveis()
+            ultima = self.txt.index(f"@0,{base - 1}")
+            inicio = self.txt.index(f"{ultima} +1 display lines display linestart")
+        return self._sem_orfaos(inicio)
+
+    _TAGS_PRESAS_A_SEGUINTE = ("titulo1", "titulo2", "titulo3", "cod_cabecalho")
+
+    def _sem_orfaos(self, inicio):
+        """Titulo e cabecalho de codigo nunca ficam sozinhos no pe da folha.
+
+        Regra de diagramacao de livro: se a ultima linha da folha e um titulo
+        (ou a faixa "PYTHON" de um bloco de codigo), ela desce junto com o que
+        vem depois. So recua ate 3 linhas e nunca esvazia a folha.
+        """
+        topo, _base = self._limites_visiveis()
+        primeira = self.txt.index(f"@0,{topo + 1} display linestart")
+        for _ in range(3):
+            anterior = self.txt.index(f"{inicio} -1 display lines display linestart")
+            if (not self.txt.compare(anterior, ">", primeira)
+                    or not self.txt.compare(anterior, "<", inicio)):
+                break
+            tags = self.txt.tag_names(anterior)
+            if not any(t in tags for t in self._TAGS_PRESAS_A_SEGUINTE):
+                break
+            inicio = anterior
+        return inicio
+
+    def _montar_folhas(self, manter_indice=None):
+        """Calcula a grade de folhas da pagina e mostra a folha certa.
+
+        `manter_indice`: indice de texto que deve continuar visivel (retomada
+        de leitura, resultado de busca, redimensionamento) ou "fim".
+        """
+        self._grade_folhas = []
+        if not self._em_folha():
+            return
+        self._aplicar_folga_final()
+        manter = None
+        if manter_indice and manter_indice != "fim":
+            try:
+                manter = self._para_offset(self.txt.index(manter_indice))
+            except Exception:
+                manter = None
+        self._simulando = True
+        try:
+            self.txt.yview("1.0")
+            self.txt.update_idletasks()
+            grade = [0]
+            for _ in range(400):
+                if self._fim_visivel():
+                    break
+                proxima = self._inicio_da_proxima_folha()
+                offset = self._para_offset(proxima)
+                if offset <= grade[-1]:
+                    break
+                # So sobrou espaco em branco (a margem do ultimo paragrafo):
+                # uma folha vazia no fim seria uma virada inutil.
+                if (not self.txt.get(proxima, "end").strip()
+                        and not self.txt.dump(proxima, "end", image=True)):
+                    break
+                grade.append(offset)
+                self.txt.yview(proxima)
+                self.txt.update_idletasks()
+            self._grade_folhas = grade
+            self._altura_da_grade = self.txt.winfo_height()
+        finally:
+            self._simulando = False
+
+        alvo = 0
+        if manter_indice == "fim":
+            alvo = len(grade) - 1
+        elif manter is not None:
+            alvo = max(i for i, inicio in enumerate(grade) if inicio <= manter)
+        self._mostrar_folha(alvo)
+
+    def _aplicar_folga_final(self):
+        """Espaco em branco depois do fim da pagina, do tamanho da tela.
+
+        O Tk nao deixa rolar alem do fim do texto: a ultima folha parava
+        "encostada" no fundo e repetia o final da folha anterior. Com a folga,
+        ela comeca no topo como todas as outras -- e o resto fica em branco,
+        como a ultima pagina de um capitulo.
+        """
+        topo, base = self._limites_visiveis()
+        self._folga_folha = base - topo
+        self.txt.tag_configure("folga_folha", spacing3=self._folga_folha)
+        self.txt.tag_remove("folga_folha", "1.0", "end")
+        self.txt.tag_add("folga_folha", "end-1c linestart", "end")
+        self.txt.tag_raise("folga_folha")
+
+    def _remover_folga_final(self):
+        self._folga_folha = 0
+        try:
+            self.txt.tag_remove("folga_folha", "1.0", "end")
+        except Exception:
+            pass
+
+    def _mostrar_folha(self, indice):
+        grade = self._grade_folhas or [0]
+        indice = max(0, min(indice, len(grade) - 1))
+        self._folha_atual = indice
+        self._simulando = True
+        try:
+            self.txt.yview(f"1.0+{grade[indice]}c")
+            self.txt.update_idletasks()
+        finally:
+            self._simulando = False
+        self._atualizar_mascara()
+        self._atualizar_rodape()
+
+    def _virar_folha(self, direcao):
+        if not self._grade_folhas:
+            self._montar_folhas(manter_indice=self.txt.index("@0,4"))
+        if direcao > 0:
+            if self._folha_atual + 1 < len(self._grade_folhas):
+                self._mostrar_folha(self._folha_atual + 1)
+            elif self.pagina_atual < self.total_paginas - 1:
+                self.proxima_pagina()
+        else:
+            if self._folha_atual > 0:
+                self._mostrar_folha(self._folha_atual - 1)
+            elif self.pagina_atual > 0:
+                # Voltar de pagina abre na ULTIMA folha da anterior: e a
+                # continuacao natural de quem esta folheando para tras.
+                self._entrar_pelo_fim = True
+                self.pagina_anterior()
+
+    def _atualizar_mascara(self):
+        if not self._em_folha():
+            self._esconder_mascara()
+            return
+        if self._mascara is None:
+            # Irma do texto, no palco -- nao filha dele. No Windows o Text
+            # redesenha por cima das proprias janelas-filhas ao rolar, e a
+            # mascara ficava invisivel mesmo "posicionada".
+            self._mascara = tk.Frame(self.palco, bd=0, highlightthickness=0)
+            self._mascara.bind("<MouseWheel>", self._ao_rolar)
+            self._mascara.bind("<Button-1>", self._clique_na_mascara)
+        # Tudo a partir do inicio da PROXIMA folha e dela: a linha cortada e,
+        # com a regra dos orfaos, um titulo que desceu junto com o texto.
+        topo, base = self._limites_visiveis()
+        info = None
+        if not self._fim_visivel():
+            info = self.txt.dlineinfo(self._inicio_da_proxima_folha())
+        if not info or not (topo + 1 < info[1] < base):
+            self._esconder_mascara()
+            return
+        y = info[1]
+        dx = self.txt.winfo_rootx() - self.palco.winfo_rootx()
+        dy = self.txt.winfo_rooty() - self.palco.winfo_rooty()
+        self._mascara.configure(bg=self.txt.cget("bg"))
+        self._mascara.place(x=dx, y=dy + y, width=self.txt.winfo_width(),
+                            height=self.txt.winfo_height() - y)
+        self._mascara.lift()
+        # O numero da pagina do modo foco tambem vive no palco: fica por cima.
+        if self.lbl_flutuante.winfo_ismapped():
+            self.lbl_flutuante.lift()
+
+    def _esconder_mascara(self):
+        if getattr(self, "_mascara", None) is not None:
+            self._mascara.place_forget()
+
+    def _clique_na_mascara(self, evento):
+        if evento.x <= max(1, self.txt.winfo_width()) * 0.3:
+            self._virar_folha(-1)
+        else:
+            self._virar_folha(1)
+
+    def _folha_apos_mudanca(self):
+        """A visao ou a geometria mudou por fora (busca, selecao arrastada,
+        janela redimensionada): refaz a grade mantendo a frase do topo."""
+        self._agendado_folha = None
+        if not self._em_folha() or self._simulando:
+            return
+        try:
+            grade = self._grade_folhas
+            no_topo = self._offset_no_topo()
+            alinhado = (grade and 0 <= self._folha_atual < len(grade)
+                        and grade[self._folha_atual] == no_topo
+                        and self.txt.winfo_height() == self._altura_da_grade)
+            if not alinhado:
+                self._montar_folhas(manter_indice=f"1.0+{no_topo}c")
+            else:
+                self._atualizar_mascara()
+        except Exception:
+            pass
+
+    def _agendar_realinhar_folha(self):
+        if self._agendado_folha is None and not self._simulando:
+            self._agendado_folha = self.after(120, self._folha_apos_mudanca)
+
     def _ao_mover_visao(self, primeiro, ultimo):
         # Mantem a barra de rolagem do CustomTkinter funcionando...
         try:
             self.area._y_scrollbar.set(primeiro, ultimo)
         except Exception:
             pass
+        # Rolagem continua: anota QUANDO o texto encostou no limite. A virada
+        # so acontece num toque de roda depois disso -- a inercia do proprio
+        # gesto que trouxe ate aqui nao vira a pagina sem querer.
+        if self.modo_virada == MODO_LIVRE and self.documento:
+            try:
+                no_limite = self._fim_visivel() or self._inicio_visivel()
+            except Exception:
+                no_limite = False
+            if no_limite and not self._limite_visto:
+                self._chegou_ao_limite = time.time()
+            self._limite_visto = no_limite
+        if self._em_folha() and not self._simulando:
+            self._agendar_realinhar_folha()
         # ...e reage a chegada ao fim/topo da pagina.
         try:
             self._atualizar_setas(float(primeiro), float(ultimo))
@@ -1807,7 +2169,17 @@ class TelaLeitor(ctk.CTkFrame):
         if self._rolagem_ativa:
             self.parar_rolagem(avisar=True)
             return
-        if self.modo_virada != MODO_MARGEM or not self.documento:
+        if self.modo_virada not in (MODO_MARGEM, MODO_FOLHA) or not self.documento:
+            return
+        if self.modo_virada == MODO_FOLHA:
+            largura = max(1, self.txt.winfo_width())
+            zona = max(40, min(self._margem_atual(), largura * 0.25))
+            if evento.x <= zona:
+                self._virar_folha(-1)
+                return "break"
+            if evento.x >= largura - zona:
+                self._virar_folha(1)
+                return "break"
             return
 
         # A zona de clique e exatamente a margem que cerca a coluna de texto,
@@ -1828,53 +2200,65 @@ class TelaLeitor(ctk.CTkFrame):
         if self._rolagem_ativa:
             self.parar_rolagem(avisar=True)
 
+        descendo = evento.delta < 0
+        if self.modo_virada == MODO_FOLHA:
+            # Um gesto, uma folha. Touchpads mandam dezenas de eventos por
+            # gesto; o intervalo minimo impede que um deslize vire cinco.
+            agora = time.time()
+            if agora - self._ultima_folha >= 0.28:
+                self._ultima_folha = agora
+                self._virar_folha(1 if descendo else -1)
+            return "break"
+
         if self.modo_virada != MODO_LIVRE:
             # Nos outros modos a roda so rola; virar e sempre um ato explicito.
             self._acumulado_wheel = 0
             return
 
-        inicio, fim = self.txt.yview()
-        descendo = evento.delta < 0
-
-        no_limite = (descendo and fim >= 0.999) or (not descendo and inicio <= 0.001)
+        no_limite = ((descendo and self._fim_visivel())
+                     or (not descendo and self._inicio_visivel()))
         if not no_limite:
             self._acumulado_wheel = 0
             return
 
-        self._acumulado_wheel += 1 if descendo else -1
-        # Exige dois toques no limite para evitar virada acidental.
-        if self._acumulado_wheel >= 2:
-            self._acumulado_wheel = 0
-            self.proxima_pagina()
-            # "break" e obrigatorio: o Tk roda ESTE handler antes da rolagem
-            # padrao do widget. Sem interromper, a pagina virava e logo em
-            # seguida levava o deslocamento da roda, abrindo com um recuo em
-            # vez de comecar no topo.
+        # Texto corrido: encostou no limite e a roda continuou -- emenda na
+        # pagina vizinha. O respiro de 0,3 s depois de encostar absorve a
+        # inercia do gesto que trouxe ate aqui.
+        if time.time() - self._chegou_ao_limite < 0.3:
             return "break"
-        if self._acumulado_wheel <= -2:
-            self._acumulado_wheel = 0
+        self._acumulado_wheel = 0
+        if descendo:
+            if self.pagina_atual < self.total_paginas - 1:
+                self.proxima_pagina()
+        elif self.pagina_atual > 0:
+            # Voltando, a pagina anterior abre pelo FIM: a leitura emenda.
+            self._entrar_pelo_fim = True
             self.pagina_anterior()
-            return "break"
+        # "break" e obrigatorio: o Tk roda ESTE handler antes da rolagem
+        # padrao do widget. Sem interromper, a pagina virava e logo em
+        # seguida levava o deslocamento da roda.
+        return "break"
 
     def _rolar_ou_virar(self, direcao):
         """Espaco/PageDown: rola a pagina; no fim dela, avanca."""
         if self._rolagem_ativa:
             self.parar_rolagem(avisar=True)
-        inicio, fim = self.txt.yview()
+        if self._em_folha():
+            self._virar_folha(direcao)
+            return
         salto = int(self.txt.winfo_height() * 0.85)
 
         if direcao > 0:
-            if fim >= 0.999:
+            if self._fim_visivel():
                 self.proxima_pagina()
             else:
                 self.txt.yview_scroll(salto, "pixels")
         else:
-            if inicio <= 0.001:
+            if self._inicio_visivel():
+                # Volta lendo o fim da pagina anterior na rolagem continua;
+                # nos demais a regra e sempre comecar do topo.
+                self._entrar_pelo_fim = self.modo_virada == MODO_LIVRE
                 self.pagina_anterior()
-                # Volta lendo o fim da pagina anterior no modo Livre; nos demais
-                # a regra e sempre comecar do topo.
-                if self.modo_virada == MODO_LIVRE:
-                    self.after(30, lambda: self.txt.yview_moveto(1.0))
             else:
                 self.txt.yview_scroll(-salto, "pixels")
 
@@ -2019,6 +2403,8 @@ class TelaLeitor(ctk.CTkFrame):
         try:
             self.update_idletasks()
             self.txt.yview(f"1.0+{int(offset)}c")
+            if self._em_folha():
+                self._montar_folhas(manter_indice=f"1.0+{int(offset)}c")
         except Exception:
             pass
 
@@ -2062,8 +2448,10 @@ class TelaLeitor(ctk.CTkFrame):
     def ativar_atalhos(self):
         raiz = self.controlador
         self._ligacoes = {
-            "<Right>": lambda e: self._se_livre(e, self.proxima_pagina),
-            "<Left>": lambda e: self._se_livre(e, self.pagina_anterior),
+            "<Right>": lambda e: self._se_livre(e, lambda: self._avancar(1)),
+            "<Left>": lambda e: self._se_livre(e, lambda: self._avancar(-1)),
+            "<Down>": lambda e: self._se_livre(e, lambda: self._seta_vertical(1)),
+            "<Up>": lambda e: self._se_livre(e, lambda: self._seta_vertical(-1)),
             "<Next>": lambda e: self._se_livre(e, lambda: self._rolar_ou_virar(1)),
             "<Prior>": lambda e: self._se_livre(e, lambda: self._rolar_ou_virar(-1)),
             "<space>": lambda e: self._se_livre(e, lambda: self._rolar_ou_virar(1)),
@@ -2108,6 +2496,10 @@ class TelaLeitor(ctk.CTkFrame):
         """Ignora o atalho quando o foco esta num campo de digitacao."""
         foco = self.controlador.focus_get()
         if isinstance(foco, (tk.Entry, ctk.CTkEntry)):
+            return
+        # Outra caixa de texto (a resposta da IA, as notas): as setas e o
+        # espaco sao dela, nao da virada de pagina.
+        if isinstance(foco, tk.Text) and foco is not self.txt:
             return
         funcao()
         return "break"
@@ -2222,7 +2614,7 @@ class TelaLeitor(ctk.CTkFrame):
         toc = self.pdf_service.obter_sumario(self.documento) if self.documento else []
         if not toc:
             C.rotulo(self.conteudo_painel,
-                     "Este PDF nao traz indice embutido.\n\nUse o campo de pagina abaixo "
+                     "Este livro nao traz indice embutido.\n\nUse o campo de pagina abaixo "
                      "ou a busca para navegar.", 11, "normal", "texto_suave",
                      wraplength=188, justify="left").pack(padx=ESP["md"], pady=ESP["lg"])
             return
@@ -2336,7 +2728,7 @@ class TelaLeitor(ctk.CTkFrame):
             # Handle proprio: o PyMuPDF nao e seguro para uso simultaneo do
             # mesmo documento em duas threads.
             try:
-                with fitz.open(caminho) as doc:
+                with abrir_livro(caminho) as doc:
                     achados = self.pdf_service.buscar_no_documento(doc, termo, cancelar)
             except Exception as erro:
                 achados = []
@@ -2990,7 +3382,7 @@ class TelaLeitor(ctk.CTkFrame):
                 # Handle proprio: o documento da interface nao aguenta duas
                 # threads. O motor tambem e refeito para nao competir com o
                 # que a leitura esta usando.
-                with fitz.open(caminho) as doc:
+                with abrir_livro(caminho) as doc:
                     motor = MotorReflow(doc)
                     resultado = perfil.montar_perfil(doc, motor, cancelar=cancelar)
             except Exception as erro:
@@ -3339,7 +3731,7 @@ class TelaLeitor(ctk.CTkFrame):
             try:
                 # Documento proprio: o fitz.Document nao e seguro para uso
                 # simultaneo, e a interface segue lendo o dela.
-                with fitz.open(caminho) as copia:
+                with abrir_livro(caminho) as copia:
                     novo = indice_livro.construir(
                         copia, id_livro, cancelar=cancelar, a_partir_de=pagina,
                         ao_progredir=lambda f: self._na_ui(
@@ -3641,7 +4033,12 @@ class TelaLeitor(ctk.CTkFrame):
     def _atualizar_rodape(self):
         atual = self.pagina_atual + 1
         total = max(1, self.total_paginas)
-        self.lbl_pagina.configure(text=f"{atual} / {total}")
+        folhas = len(self._grade_folhas) if self._em_folha() else 0
+        if folhas > 1:
+            self.lbl_pagina.configure(
+                text=f"{atual} / {total}  ·  folha {self._folha_atual + 1}/{folhas}")
+        else:
+            self.lbl_pagina.configure(text=f"{atual} / {total}")
         self.progresso.set(atual / total)
 
         restantes = total - atual
@@ -3718,10 +4115,10 @@ class PopoverTipografia(ctk.CTkFrame):
 
         self._secao("Virar pagina")
         C.seletor(self.corpo, list(MODOS_VIRADA.keys()), self._definir_modo, largura=250,
-                  valor=cfg.obter("modo_virada", MODO_VIRADA_PADRAO)).pack(
+                  valor=normalizar_modo_virada(cfg.obter("modo_virada", MODO_VIRADA_PADRAO))).pack(
             fill="x", padx=ESP["md"])
         self.lbl_modo = C.rotulo(
-            self.corpo, MODOS_VIRADA.get(cfg.obter("modo_virada"), ""), 9, "normal",
+            self.corpo, MODOS_VIRADA.get(normalizar_modo_virada(cfg.obter("modo_virada")), ""), 9, "normal",
             "texto_suave", wraplength=250, justify="left")
         self.lbl_modo.pack(fill="x", padx=ESP["md"], pady=(3, 0))
 
@@ -3928,7 +4325,7 @@ class PopoverTipografia(ctk.CTkFrame):
 
     def _atualizar_linha_velocidade(self):
         """O controle de velocidade so faz sentido na rolagem automatica."""
-        if self.cfg.obter("modo_virada") == MODO_AUTO:
+        if normalizar_modo_virada(self.cfg.obter("modo_virada")) == MODO_AUTO:
             self.linha_velocidade.pack(fill="x", padx=ESP["md"], pady=(ESP["md"], 2))
             self.controle_velocidade.pack(fill="x", padx=ESP["md"])
             self.lbl_vel.configure(

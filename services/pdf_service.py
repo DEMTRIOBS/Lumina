@@ -11,6 +11,31 @@ from configuracoes import PASTA_CAPAS
 
 _RE_ESPACOS = re.compile(r"\s+")
 
+# ------------------------------------------------------------------ FORMATOS
+# Tudo o que o Lumina abre. O EPUB nao tem paginas: o MuPDF as monta a partir
+# de um tamanho de pagina e de letra. Esse tamanho PRECISA ser sempre o mesmo
+# -- se cada parte do app paginasse de um jeito, a "pagina 40" do progresso,
+# dos grifos e das notas apontaria para trechos diferentes. Por isso todo
+# arquivo e aberto por `abrir()`, nunca por fitz.open direto.
+EXTENSOES = (".pdf", ".epub")
+TIPOS_ARQUIVO = [("Livros (PDF, EPUB)", "*.pdf *.epub"), ("PDF", "*.pdf"),
+                 ("EPUB", "*.epub")]
+# Formato A5 com letra de livro: paginas do tamanho das de um PDF comum, o
+# que mantem estaveis o motor de leitura e a estimativa de tempo restante.
+_LAYOUT_REFLUIVEL = {"width": 420, "height": 595, "fontsize": 11}
+
+
+def eh_livro(caminho) -> bool:
+    return str(caminho).lower().endswith(EXTENSOES)
+
+
+def abrir(caminho: str):
+    """Abre PDF ou EPUB. Use SEMPRE isto no lugar de fitz.open."""
+    doc = fitz.open(caminho)
+    if doc.is_reflowable:
+        doc.layout(**_LAYOUT_REFLUIVEL)
+    return doc
+
 # Titulos que geradores de PDF gravam sozinhos e nao dizem nada sobre o livro.
 # Sem esta lista a estante exibe coisas como "PDF Content" no lugar do nome.
 _TITULOS_LIXO = (
@@ -60,7 +85,7 @@ class PDFService:
             "total_paginas": 0,
         }
         try:
-            with fitz.open(caminho) as doc:
+            with abrir(caminho) as doc:
                 info["total_paginas"] = len(doc)
                 meta = doc.metadata or {}
                 titulo = (meta.get("title") or "").strip()
@@ -80,7 +105,7 @@ class PDFService:
         if os.path.exists(caminho_capa) and not forcar:
             return caminho_capa
         try:
-            with fitz.open(caminho_pdf) as doc:
+            with abrir(caminho_pdf) as doc:
                 if len(doc) == 0:
                     return None
                 pagina = doc.load_page(0)
@@ -97,7 +122,7 @@ class PDFService:
     @staticmethod
     def abrir_documento(caminho_pdf: str):
         try:
-            doc = fitz.open(caminho_pdf)
+            doc = abrir(caminho_pdf)
             if doc.needs_pass:
                 doc.close()
                 return None
@@ -109,7 +134,7 @@ class PDFService:
     @staticmethod
     def esta_protegido(caminho_pdf: str) -> bool:
         try:
-            with fitz.open(caminho_pdf) as doc:
+            with abrir(caminho_pdf) as doc:
                 return bool(doc.needs_pass)
         except Exception:
             return False

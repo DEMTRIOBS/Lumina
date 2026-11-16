@@ -18,7 +18,7 @@ from database.biblioteca import BancoBiblioteca
 from database.config import BancoConfig
 from database.pastas import BancoPastas
 from database.sqlite_db import fechar_conexao, inicializar_banco
-from services.pdf_service import PDFService
+from services.pdf_service import PDFService, eh_livro
 from ui.estante import TelaEstante
 from ui.leitor import TelaLeitor
 
@@ -116,7 +116,7 @@ class App(ctk.CTk):
         except Exception:
             pass
         # "Abrir com > Lumina" ou arrastar um PDF sobre o .exe.
-        pdfs = [a for a in sys.argv[1:] if a.lower().endswith(".pdf")]
+        pdfs = [a for a in sys.argv[1:] if eh_livro(a)]
         if pdfs:
             self.after(200, lambda: self.abrir_arquivo(pdfs[0]))
 
@@ -133,7 +133,7 @@ class App(ctk.CTk):
                 self.banco.definir_caminho(id_livro, caminho)
             else:
                 if self.pdf_service.esta_protegido(caminho):
-                    C.Toast.mostrar(self, "PDF protegido por senha.", "erro")
+                    C.Toast.mostrar(self, "Arquivo protegido por senha.", "erro")
                     return
                 meta = self.pdf_service.extrair_metadados(caminho)
                 capa = self.pdf_service.extrair_capa(caminho, id_livro)
@@ -481,7 +481,7 @@ class App(ctk.CTk):
         self.banco_config.definir_bool("primeira_execucao", False)
         Modais.aviso(
             self.telas["estante"], f"Bem-vindo ao {APP_NOME}",
-            "Adicione um PDF e ele vira um livro refluido: paragrafos remontados, "
+            "Adicione um PDF ou EPUB e ele vira um livro refluido: paragrafos remontados, "
             "cabecalhos removidos e tipografia que voce controla.\n\n"
             "Feito para tela dividida:\n"
             "  Ctrl+Shift+←/→   encaixa em metade da tela\n"

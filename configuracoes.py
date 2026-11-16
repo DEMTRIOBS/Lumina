@@ -9,7 +9,7 @@ import os
 from core.paths import migrar_dados_locais, user_path
 
 APP_NOME = "Lumina"
-APP_VERSAO = "2.1"
+APP_VERSAO = "2.2"
 
 # ---------------------------------------------------------------- ARMAZENAMENTO
 migrar_dados_locais(
@@ -475,18 +475,29 @@ ALTURA_LINHA_PADRAO = 1.6
 
 # ------------------------------------------------------- VIRADA DE PAGINA
 # Como o leitor avanca de pagina. Cada modo troca o gesto, nunca o conteudo.
-MODO_LIVRE = "Livre"
+MODO_LIVRE = "Rolagem continua"
+MODO_FOLHA = "Folhear (cabe na tela)"
 MODO_BOTOES = "Botoes flutuantes"
 MODO_MARGEM = "Clique na margem"
 MODO_AUTO = "Rolagem automatica"
 
 MODOS_VIRADA = {
-    MODO_LIVRE: "A roda rola e, no fim da pagina, vira sozinha.",
+    MODO_LIVRE: "Texto corrido: a roda rola e emenda uma pagina na outra.",
+    MODO_FOLHA: "Sem rolagem: o texto cabe na tela, como um livro. Roda, "
+                "setas, espaco ou clique na margem viram a folha.",
     MODO_BOTOES: "Setas surgem nas laterais ao chegar ao fim. So elas viram.",
     MODO_MARGEM: "Clicar na margem esquerda ou direita vira a pagina.",
     MODO_AUTO: "A pagina rola sozinha e avanca ao chegar ao fim.",
 }
 MODO_VIRADA_PADRAO = MODO_LIVRE
+
+# Nomes antigos gravados na configuracao de quem ja usava o app.
+_MODOS_ANTIGOS = {"Livre": MODO_LIVRE}
+
+
+def normalizar_modo_virada(valor):
+    valor = _MODOS_ANTIGOS.get(valor, valor)
+    return valor if valor in MODOS_VIRADA else MODO_VIRADA_PADRAO
 
 # Velocidade da rolagem automatica: 1 (bem lenta) a 10 (rapida).
 VELOCIDADE_ROLAGEM_PADRAO = 4

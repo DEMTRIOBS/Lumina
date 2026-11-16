@@ -1125,7 +1125,7 @@ class Modais:
         C.rotulo(area, f"Versao {APP_VERSAO}", 11, "normal", "texto_suave",
                  ancora="center").pack(pady=(2, ESP["lg"]))
         C.rotulo(area,
-                 "Converte PDF em livro refluido para leitura confortavel em tela\n"
+                 "Converte PDF e EPUB em livro refluido para leitura confortavel em tela\n"
                  "dividida, ao lado das suas outras janelas de trabalho.",
                  12, "normal", "texto_suave", ancora="center", justify="center").pack()
 

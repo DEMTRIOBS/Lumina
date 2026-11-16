@@ -218,7 +218,64 @@ class TestRoteador(unittest.TestCase):
                 self.assertEqual(rotear(pergunta), esperado)
 
 
+def _epub_minimo(caminho, capitulos=4):
+    import zipfile
+    par = "<p>" + FRASE * 3 + "</p>"
+    with zipfile.ZipFile(caminho, "w") as z:
+        z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        z.writestr("META-INF/container.xml",
+                   '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:'
+                   'names:tc:opendocument:xmlns:container"><rootfiles><rootfile '
+                   'full-path="c.opf" media-type="application/oebps-package+xml"/>'
+                   '</rootfiles></container>')
+        itens = espinha = ""
+        for n in range(capitulos):
+            z.writestr(f"c{n}.xhtml",
+                       '<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+                       f"<h1>Capitulo {n + 1}</h1>{par * 6}</body></html>")
+            itens += f'<item id="c{n}" href="c{n}.xhtml" media-type="application/xhtml+xml"/>'
+            espinha += f'<itemref idref="c{n}"/>'
+        z.writestr("c.opf",
+                   '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" '
+                   'unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/'
+                   'elements/1.1/"><dc:identifier id="i">x</dc:identifier>'
+                   '<dc:title>Livro EPUB de Teste</dc:title><dc:creator>Autora</dc:creator>'
+                   f'</metadata><manifest>{itens}</manifest><spine>{espinha}</spine></package>')
+
+
+class TestEpub(unittest.TestCase):
+
+    def setUp(self):
+        self.caminho = os.path.join(tempfile.mkdtemp(), "teste.epub")
+        _epub_minimo(self.caminho)
+
+    def test_paginacao_e_estavel(self):
+        """Grifo e progresso apontam para paginas: abrir duas vezes tem que
+        paginar igual, senao a "pagina 3" muda de lugar."""
+        from services.pdf_service import abrir
+        with abrir(self.caminho) as a, abrir(self.caminho) as b:
+            self.assertGreater(len(a), 1)
+            self.assertEqual(len(a), len(b))
+            ultima = len(a) - 1
+            self.assertEqual(a.load_page(ultima).get_text(), b.load_page(ultima).get_text())
+
+    def test_metadados_e_reflow(self):
+        from services.pdf_service import PDFService, abrir, eh_livro
+        self.assertTrue(eh_livro(self.caminho))
+        meta = PDFService.extrair_metadados(self.caminho)
+        self.assertEqual(meta["titulo"], "Livro EPUB de Teste")
+        with abrir(self.caminho) as doc:
+            blocos = MotorReflow(doc).pagina(0).blocos
+            self.assertTrue(any(b.tipo == "titulo" for b in blocos))
+            self.assertTrue(any(b.tipo == "paragrafo" for b in blocos))
+
+
 class TestDiversos(unittest.TestCase):
+
+    def test_modo_livre_antigo_vira_rolagem_continua(self):
+        from configuracoes import MODO_LIVRE, MODO_VIRADA_PADRAO, normalizar_modo_virada
+        self.assertEqual(normalizar_modo_virada("Livre"), MODO_LIVRE)
+        self.assertEqual(normalizar_modo_virada("modo-que-nao-existe"), MODO_VIRADA_PADRAO)
 
     def test_regex_de_citacao_nao_trava(self):
         inicio = time.time()

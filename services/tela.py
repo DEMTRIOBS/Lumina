@@ -31,6 +31,7 @@ do motor de contexto -- e o texto lido nunca sai da maquina: vai so para o
 modelo local, e nem chega a ser gravado em disco.
 """
 import ctypes
+import queue
 import threading
 import time
 
@@ -79,6 +80,16 @@ _RUIDO = {
     "barra de endereco e de pesquisa", "barra de endereço e de pesquisa",
 }
 
+# Avisos que editores publicam no lugar do conteudo. O VS Code, por exemplo,
+# so expoe o codigo com o "modo leitor de tela" dele ligado; sem isso, o
+# editor responde com esta frase -- que falaria de acessibilidade, nao do
+# assunto, e puxaria a classificacao para o lado errado.
+_RUIDO_PREFIXOS = (
+    "o editor não está acessível", "o editor nao esta acessivel",
+    "the editor is not accessible", "terminal 1,", "entrada de terminal",
+    "message input", "seção do explorador", "secao do explorador",
+)
+
 _local = threading.local()
 
 
@@ -112,6 +123,33 @@ def _metodo(ponteiro, indice, assinatura):
     return ctypes.WINFUNCTYPE(*assinatura)(endereco)
 
 
+_RELEASE = 2
+
+
+def _soltar(ponteiro):
+    """IUnknown::Release. Todo ponteiro COM recebido e nosso para soltar.
+
+    Esquecer isto era o vazamento: cada leitura abandonava o elemento, a
+    condicao, a lista e cada filho -- dezenas de objetos a cada 2,5 s, que
+    o processo da OUTRA janela tambem precisava manter vivos.
+    """
+    if ponteiro:
+        try:
+            _metodo(ponteiro, _RELEASE, (ctypes.c_ulong, ctypes.c_void_p))(ponteiro)
+        except Exception:
+            pass
+
+
+def _ler_bstr(bstr):
+    """Copia um BSTR para str e devolve a memoria ao Windows."""
+    if not bstr.value:
+        return ""
+    try:
+        return ctypes.wstring_at(bstr.value)
+    finally:
+        ctypes.windll.oleaut32.SysFreeString(bstr)
+
+
 def _automacao():
     """A instancia de UI Automation DESTA thread.
 
@@ -141,7 +179,7 @@ def _automacao():
 
 
 def disponivel() -> bool:
-    return bool(_automacao())
+    return wintypes is not None and hasattr(ctypes, "windll")
 
 
 def _condicao_de_tipo(automacao, tipo):
@@ -159,46 +197,59 @@ def _condicao_de_tipo(automacao, tipo):
 
 def _nomes_do_tipo(automacao, alca, tipo, teto):
     elemento = ctypes.c_void_p()
-    resultado = _metodo(
-        automacao, _IUIAUTOMATION_ELEMENT_FROM_HANDLE,
-        (ctypes.HRESULT, ctypes.c_void_p, wintypes.HWND,
-         ctypes.POINTER(ctypes.c_void_p)))(
-        automacao, alca, ctypes.byref(elemento))
-    if resultado != 0 or not elemento:
-        return []
-
-    condicao = _condicao_de_tipo(automacao, tipo)
-    if condicao is None:
-        return []
-
     achados = ctypes.c_void_p()
-    resultado = _metodo(
-        elemento, _ELEMENT_FIND_ALL,
-        (ctypes.HRESULT, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
-         ctypes.POINTER(ctypes.c_void_p)))(
-        elemento, _TREESCOPE_DESCENDANTS, condicao, ctypes.byref(achados))
-    if resultado != 0 or not achados:
-        return []
-
-    quantos = ctypes.c_int()
-    _metodo(achados, _ARRAY_GET_LENGTH,
-            (ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)))(
-        achados, ctypes.byref(quantos))
-
+    condicao = None
     saida = []
-    for indice in range(min(quantos.value, teto)):
-        filho = ctypes.c_void_p()
-        if _metodo(achados, _ARRAY_GET_ELEMENT,
-                   (ctypes.HRESULT, ctypes.c_void_p, ctypes.c_int,
-                    ctypes.POINTER(ctypes.c_void_p)))(
-                achados, indice, ctypes.byref(filho)) != 0 or not filho:
-            continue
-        nome = ctypes.c_wchar_p()
-        if _metodo(filho, _ELEMENT_GET_CURRENT_NAME,
-                   (ctypes.HRESULT, ctypes.c_void_p,
-                    ctypes.POINTER(ctypes.c_wchar_p)))(
-                filho, ctypes.byref(nome)) == 0 and nome.value:
-            saida.append(nome.value)
+    try:
+        resultado = _metodo(
+            automacao, _IUIAUTOMATION_ELEMENT_FROM_HANDLE,
+            (ctypes.HRESULT, ctypes.c_void_p, wintypes.HWND,
+             ctypes.POINTER(ctypes.c_void_p)))(
+            automacao, alca, ctypes.byref(elemento))
+        if resultado != 0 or not elemento:
+            return []
+
+        condicao = _condicao_de_tipo(automacao, tipo)
+        if condicao is None:
+            return []
+
+        resultado = _metodo(
+            elemento, _ELEMENT_FIND_ALL,
+            (ctypes.HRESULT, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+             ctypes.POINTER(ctypes.c_void_p)))(
+            elemento, _TREESCOPE_DESCENDANTS, condicao, ctypes.byref(achados))
+        if resultado != 0 or not achados:
+            return []
+
+        quantos = ctypes.c_int()
+        _metodo(achados, _ARRAY_GET_LENGTH,
+                (ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)))(
+            achados, ctypes.byref(quantos))
+
+        for indice in range(min(quantos.value, teto)):
+            filho = ctypes.c_void_p()
+            if _metodo(achados, _ARRAY_GET_ELEMENT,
+                       (ctypes.HRESULT, ctypes.c_void_p, ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_void_p)))(
+                    achados, indice, ctypes.byref(filho)) != 0 or not filho:
+                continue
+            try:
+                # O nome chega como BSTR alocado pelo Windows. Ler como
+                # c_wchar_p copiava o texto e nunca devolvia a memoria.
+                nome = ctypes.c_void_p()
+                if _metodo(filho, _ELEMENT_GET_CURRENT_NAME,
+                           (ctypes.HRESULT, ctypes.c_void_p,
+                            ctypes.POINTER(ctypes.c_void_p)))(
+                        filho, ctypes.byref(nome)) == 0:
+                    texto = _ler_bstr(nome)
+                    if texto:
+                        saida.append(texto)
+            finally:
+                _soltar(filho)
+    finally:
+        _soltar(achados)
+        _soltar(condicao)
+        _soltar(elemento)
     return saida
 
 
@@ -212,7 +263,7 @@ def _limpar(trechos):
         if len(texto) < _MIN_CHARS_TRECHO:
             continue
         chave = texto.lower()
-        if chave in _RUIDO or chave in vistos:
+        if chave in _RUIDO or chave in vistos or chave.startswith(_RUIDO_PREFIXOS):
             continue
         vistos.add(chave)
         saida.append(texto)
@@ -222,18 +273,10 @@ def _limpar(trechos):
     return saida
 
 
-def texto_da_janela(alca) -> str:
-    """Texto legivel da janela, ja limpo e limitado. "" quando nao da.
-
-    Nao levanta excecao: qualquer falha de COM vira string vazia, e quem
-    chamou segue sem o sinal em vez de quebrar a leitura.
-    """
-    if not alca or wintypes is None:
-        return ""
+def _ler_agora(alca) -> str:
     automacao = _automacao()
     if not automacao:
         return ""
-
     trechos = []
     for tipo in _TIPOS_COM_TEXTO:
         try:
@@ -243,6 +286,51 @@ def texto_da_janela(alca) -> str:
         if sum(len(t) for t in trechos) >= _MAX_CHARS:
             break
     return "\n".join(_limpar(trechos))[:_MAX_CHARS]
+
+
+# ------------------------------------------------------------ THREAD DEDICADA
+# COM e por thread. Antes, cada analise abria uma thread nova, e cada uma
+# criava -- e abandonava ao morrer -- a sua propria instancia de UI Automation
+# e o seu apartamento COM: um segundo vazamento, que crescia a cada janela
+# analisada. Agora UMA thread faz todas as leituras, com UMA instancia.
+_pedidos = queue.Queue()
+_trabalhador = None
+_trava_trabalhador = threading.Lock()
+
+
+def _laco():
+    while True:
+        alca, caixa = _pedidos.get()
+        try:
+            caixa["texto"] = _ler_agora(alca)
+        except Exception:
+            caixa["texto"] = ""
+        finally:
+            caixa["pronto"].set()
+
+
+def _garantir_trabalhador():
+    global _trabalhador
+    with _trava_trabalhador:
+        if _trabalhador is None or not _trabalhador.is_alive():
+            _trabalhador = threading.Thread(target=_laco, name="lumina-uia",
+                                            daemon=True)
+            _trabalhador.start()
+
+
+def texto_da_janela(alca, espera=4.0) -> str:
+    """Texto legivel da janela, ja limpo e limitado. "" quando nao da.
+
+    Nao levanta excecao: qualquer falha de COM vira string vazia, e quem
+    chamou segue sem o sinal em vez de quebrar a leitura.
+    """
+    if not alca or wintypes is None:
+        return ""
+    _garantir_trabalhador()
+    caixa = {"texto": "", "pronto": threading.Event()}
+    _pedidos.put((alca, caixa))
+    caixa["pronto"].wait(espera)
+    return caixa["texto"]
 
 
 # ------------------------------------------------------------------- CACHE

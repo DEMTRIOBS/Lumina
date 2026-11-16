@@ -2,7 +2,7 @@
 
 <img src="arte/lumina@2x.png" alt="Lumina — PDF Reader" width="720">
 
-Transforma PDF em um livro de verdade para ler em tela dividida.
+Transforma PDF e EPUB em um livro de verdade para ler em tela dividida.
 
 [![CI](https://github.com/DEMTRIOBS/Lumina/actions/workflows/ci.yml/badge.svg)](https://github.com/DEMTRIOBS/Lumina/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/DEMTRIOBS/Lumina?label=download)](https://github.com/DEMTRIOBS/Lumina/releases/latest)
@@ -26,6 +26,11 @@ navegador ou da aula.
   d'água, e reconhece títulos, listas, citações, legendas e código.
 - **Texto justificado** nas duas margens, com a última linha do parágrafo à
   esquerda, como num livro — e recalculado a cada largura de janela.
+- **Folhear ou rolar** — o modo *Folhear* faz o texto caber na tela e vira por
+  folhas, sem linha cortada e sem título órfão no pé da folha; a *Rolagem
+  contínua* emenda uma página na outra como um texto corrido.
+- **PDF e EPUB** — o EPUB passa pelo mesmo motor: capítulos, sumário, código,
+  figuras, grifos e progresso.
 - **Figuras no lugar certo**, inclusive diagramas vetoriais; um clique abre em
   tamanho real.
 - **Código como num editor** — 14 linguagens com realce, numeração do PDF
@@ -149,18 +154,25 @@ capítulo saía picado em parágrafos de uma palavra.
 
 ### Como virar a página (Ctrl+P)
 
-Quatro modos, porque cada jeito de estudar pede um gesto diferente:
+Cinco modos, porque cada jeito de estudar pede um gesto diferente:
 
 | Modo | Como funciona |
 | --- | --- |
-| **Livre** (padrão) | A roda rola; ao passar do fim da página, vira sozinha |
+| **Rolagem contínua** (padrão) | Texto corrido: a roda rola e, ao encostar no fim, emenda na página seguinte. Voltando, a anterior abre pelo fim |
+| **Folhear (cabe na tela)** | Sem barra de rolagem: o texto cabe na tela e vira por folhas — roda, setas, espaço ou clique na margem. A folha seguinte começa exatamente na linha que não coube; nenhuma linha aparece cortada, e título ou cabeçalho de código nunca ficam sozinhos no pé da folha. O rodapé mostra `página · folha 2/4` |
 | **Botões flutuantes** | Setas redondas surgem nas laterais **só ao chegar ao fim** da página. A roda nunca vira sozinha — nada de pular meia página sem querer |
 | **Clique na margem** | Clicar na margem esquerda/direita vira. Como a coluna é estreita e centralizada, a margem é área vazia: selecionar texto continua normal |
 | **Rolagem automática** | A página rola sozinha e avança no fim. Controle flutuante com ▶/⏸ e velocidade de 1 a 10 (`Ctrl+Espaço`, ou qualquer rolagem manual, pausa) |
 
 Nos modos **Botões** e **Margem**, toda página nova começa do topo — inclusive
-voltando. No modo **Livre**, voltar cai no fim da página anterior, para a
-leitura seguir contínua.
+voltando. Na **Rolagem contínua** e no **Folhear**, voltar cai no fim da
+página anterior (na última folha), para a leitura seguir sem emendas.
+
+### EPUB
+
+EPUB não tem páginas fixas: o Lumina pagina sempre no mesmo formato (A5, letra
+11), para que a "página 40" dos grifos, notas e progresso seja sempre o mesmo
+trecho. Título, autor, capa e sumário vêm do próprio arquivo.
 
 ## Duas camadas: como exibir × sobre o que é
 
@@ -426,6 +438,11 @@ servidor: vive 45 segundos em memória e é descartado.
 
 Interruptor **separado** do resto do contexto, e desligado de fábrica: aceitar
 "veja qual programa está aberto" não é aceitar "leia o que está escrito nele".
+
+**Com o VS Code ao lado:** o título da janela já basta (`views.py — projeto`
+→ programação, Python). O conteúdo do editor o VS Code só publica com o modo
+leitor de tela dele ligado (`Shift+Alt+F1`); sem isso, o Lumina lê o
+explorador de arquivos, as abas e o terminal.
 
 ### O palpite da IA na detecção de contexto
 

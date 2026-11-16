@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.2 — 2026-11-16
+
+### Leitura
+- **Modo Folhear (cabe na tela):** sem barra de rolagem; o texto vira por
+  folhas com a roda, as setas, o espaço ou um clique na margem. A folha
+  seguinte começa exatamente na linha que não coube, nenhuma linha aparece
+  cortada no pé, e títulos/cabeçalhos de código descem junto com o texto
+  (sem órfãos). Rodapé com `folha 2/4`; voltar abre a última folha da página
+  anterior; a grade é refeita ao redimensionar, mantendo a frase do topo.
+- **Rolagem contínua** (antigo "Livre"): vira com um toque ao encostar no fim
+  (antes eram dois), ignora a inércia do gesto e, voltando, abre a página
+  anterior pelo fim. Limites medidos na tela, não estimados pelo Tk.
+- Setas ↑/↓ rolam (ou folheiam) o texto; atalhos não disparam mais enquanto
+  se digita na resposta da IA ou nas notas.
+
+### Formatos
+- **EPUB**: abrir, capa, título/autor, sumário, busca, grifos e progresso.
+  Paginação fixa (A5, letra 11) em todo o app, para os grifos não mudarem de
+  lugar.
+
+### Correções
+- **Vazamento de memória na leitura da janela ao lado:** objetos COM e textos
+  (BSTR) nunca eram liberados, e cada análise criava uma instância nova de UI
+  Automation numa thread descartável. Medido em 80 leituras do VS Code: de
+  +57 MB para +1 MB.
+- Avisos de acessibilidade de editores ("O editor não está acessível…") não
+  contam mais como assunto da janela.
+
 ## 2.1 — 2026-11-16
 
 ### Leitura e aparência
