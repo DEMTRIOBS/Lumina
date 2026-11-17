@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.3.4 — 2026-11-17
+
+Livros convertidos pelo Calibre (continuacao):
+- Cabecalho que muda a cada capitulo ("Capitulo 1. Comece a programar hoje"
+  em toda pagina par) e removido: o livro inteiro e varrido uma vez.
+- Codigo achatado dentro do paragrafo ('if(x) { ... } Falta so...') e
+  separado do texto e reformatado com quebras de linha e recuo.
+- Titulo de secao grudado na primeira frase ("2.8 Revise o codigo: crie sua
+  primeira funcao Vamos escrever...") e separado.
+- Hifen de quebra de linha desfeito tambem quando a palavra so aparece
+  partida ("pecu-liaridades"), preservando pronomes e compostos.
+
 ## 2.3.3 — 2026-11-17
 
 - EPUB convertido pelo Calibre a partir de PDF: cabecalho, numero de pagina e

@@ -541,8 +541,114 @@ def _frase_interrompida(texto_a, texto_b) -> bool:
 
 
 _RE_ROTULO_DE_SECAO = re.compile(
-    r"^(?:cap[ií]tulo|chapter|parte|part|livro|se[cç][aã]o|section|aula|li[cç][aã]o)\s+#",
+    r"^(?:cap[ií]tulo|chapter|parte|part|livro|se[cç][aã]o|section|aula|li[cç][aã]o)\s+#\.?$",
     re.IGNORECASE)
+
+_RE_TITULO_NUMERADO = re.compile(r"^(\d{1,2}(?:\.\d{1,2})+)\.?\s+([A-ZÁÉÍÓÚÂÊÔÃÕÇ].*)$")
+# Inclui palavra de uma letra: "...de futebol O nosso grande rival".
+_RE_PALAVRA_MAIUSCULA = re.compile(r"\s([A-ZÁÉÍÓÚÂÊÔÃÕÇ][a-zà-ÿ]*)\s")
+
+
+def _separar_titulo_numerado(texto):
+    """("2.8 Titulo", resto) para "2.8 Titulo da secao Primeira frase."
+
+    No EPUB convertido, numero e titulo de secao vem num paragrafo so -- as
+    vezes grudados na primeira frase do texto. Titulo curto sem ponto final
+    e titulo inteiro; senao corta onde comeca uma frase (Maiuscula depois de
+    pelo menos 3 palavras), desde que o resto seja uma frase completa --
+    assim "Utilize o Chrome e o Notepad++" nao e partido no nome proprio.
+    """
+    m = _RE_TITULO_NUMERADO.match((texto or "").strip())
+    if not m:
+        return None, texto
+    numero, corpo = m.group(1), m.group(2).strip()
+    if len(corpo) <= 80 and not corpo.endswith((".", "!", ":", ";", ",")):
+        return f"{numero} {corpo}", ""
+    for achado in _RE_PALAVRA_MAIUSCULA.finditer(corpo):
+        titulo, resto = corpo[:achado.start()].strip(), corpo[achado.start():].strip()
+        if (len(titulo.split()) >= 3 and len(titulo) <= 90
+                and len(resto.split()) >= 3 and resto.endswith((".", "!", "?", ":"))):
+            return f"{numero} {titulo}", resto
+        break
+    return None, texto
+
+
+_RE_INICIO_DE_PROSA = re.compile(
+    r"[;}]\s+(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ][a-zà-ÿ]+[,]?\s+[a-zà-ÿ])")
+
+
+def _separar_codigo_do_texto(texto):
+    """(codigo, resto) quando o paragrafo COMECA com codigo grudado.
+
+    O conversor juntou a listagem e o paragrafo seguinte numa linha so:
+    'if(pontos < 28) { mostra("..."); } Falta so uma comparacao...'. O corte
+    e no primeiro ';' ou '}' seguido de uma frase (Maiuscula + minuscula).
+    """
+    linha = texto.strip()
+    if not _RE_PREFIXO_CODIGO.match(linha):
+        return None
+    corte = _RE_INICIO_DE_PROSA.search(linha)
+    if corte:
+        return linha[:corte.start() + 1].strip(), linha[corte.end():].strip()
+    if len(linha) <= 300 and linha.endswith((";", "}", ")")):
+        return linha, ""
+    return None
+
+
+def _formatar_codigo(codigo):
+    """Devolve as quebras de linha e o recuo a um codigo achatado.
+
+    Corta depois de ';' (fora de parenteses e strings), depois de '{' e
+    antes de '}'. "} else {" fica numa linha, como se escreve.
+    """
+    if "\n" in codigo:
+        return codigo
+    linhas, atual = [], ""
+    nivel = parenteses = 0
+    aspas = None
+    i = 0
+    while i < len(codigo):
+        ch = codigo[i]
+        if aspas:
+            atual += ch
+            if ch == aspas and codigo[i - 1] != "\\":
+                aspas = None
+        elif ch in "\"'`":
+            aspas = ch
+            atual += ch
+        elif ch == "(":
+            parenteses += 1
+            atual += ch
+        elif ch == ")":
+            parenteses = max(0, parenteses - 1)
+            atual += ch
+        elif ch == ";" and parenteses == 0:
+            linhas.append("    " * nivel + (atual + ";").strip())
+            atual = ""
+        elif ch == "{":
+            linhas.append("    " * nivel + (atual.rstrip() + " {").strip())
+            nivel += 1
+            atual = ""
+        elif ch == "}":
+            if atual.strip():
+                linhas.append("    " * nivel + atual.strip())
+            nivel = max(0, nivel - 1)
+            resto = codigo[i + 1:].lstrip()
+            if resto.startswith("else"):
+                atual = "} "
+                i += 1
+                while i < len(codigo) and codigo[i] == " ":
+                    i += 1
+                continue
+            linhas.append("    " * nivel + "}")
+            atual = ""
+        else:
+            atual += ch
+        i += 1
+    if atual.strip():
+        linhas.append("    " * nivel + atual.strip())
+    return "\n".join(l for l in linhas if l.strip())
+
 
 _RE_NUM_SECAO = re.compile(r"^\d{1,2}(?:\.\d{1,3})+\.?$")
 _RE_CAPITULO = re.compile(r"^(?:cap[ií]tulo|chapter)\s+\d{1,3}$", re.IGNORECASE)
@@ -955,6 +1061,8 @@ class MotorReflow:
                     and (len(a.split()) >= 2 or "@" in a
                                               or (self.corpo_negrito and not any(
                                                   ch.isalpha() for ch in a)))}
+            if self.corpo_negrito:
+                self._varrer_livro_inteiro()
             minimo_img = max(3, int(paginas_validas * _LIMIAR_IMAGEM_RECORRENTE))
             self.imagens_recorrentes = {a for a, c in contagem_imagem.items()
                                         if c >= minimo_img}
@@ -1198,6 +1306,23 @@ class MotorReflow:
                     saida.append(Bloco("codigo", "\n".join(linhas)))
                     i = j
                     continue
+            if self.corpo_negrito and bloco.tipo == "paragrafo":
+                titulo, resto = _separar_titulo_numerado(texto)
+                if titulo:
+                    saida.append(Bloco("titulo", titulo, nivel=2))
+                    if not resto:
+                        i += 1
+                        continue
+                    bloco.texto = resto
+            if self.codigo_por_conteudo and bloco.tipo == "paragrafo" and bloco.texto:
+                partes = _separar_codigo_do_texto(bloco.texto)
+                if partes:
+                    codigo, resto = partes
+                    saida.append(Bloco("codigo", _formatar_codigo(codigo)))
+                    if not resto:
+                        i += 1
+                        continue
+                    bloco.texto = resto
             if self.corpo_negrito and bloco.tipo in ("paragrafo", "citacao", "lista") \
                     and bloco.texto:
                 bloco.texto = self._tirar_cabecalho_colado(bloco.texto)
@@ -1255,22 +1380,89 @@ class MotorReflow:
                            flags=re.IGNORECASE)
         return re.sub(r"\s{2,}", " ", texto).strip()
 
+    def _varrer_livro_inteiro(self):
+        """Uma passada no livro todo (so nos livros sem estrutura).
+
+        A amostra da analise ve ~24 paginas -- pouco para achar o cabecalho
+        que muda a cada capitulo ("Capitulo 1. Comece a programar hoje" em
+        toda pagina par do capitulo 1). Aqui cada linha curta guarda em que
+        paginas aparece; se ela volta em boa parte das paginas entre a
+        primeira e a ultima vez, e cabecalho corrido. "Resumo do capitulo",
+        uma vez por capitulo, fica.
+        Aproveita a passada para o vocabulario do livro (palavras inteiras e
+        palavras com hifen), usado para desfazer hifens de quebra de linha.
+        """
+        from collections import defaultdict
+        from services.pdf_service import tabela_de_texto
+        tabela = tabela_de_texto(self.doc)
+        paginas = defaultdict(list)
+        palavras, hifenizadas = Counter(), Counter()
+        for numero in range(len(self.doc)):
+            try:
+                bruto = self.doc.load_page(numero).get_text("text")
+            except Exception:
+                continue
+            if tabela:
+                bruto = bruto.translate(tabela)
+            vistas = set()
+            for linha in bruto.split("\n"):
+                linha = linha.strip()
+                if 6 <= len(linha) <= 90:
+                    vistas.add(_normalizar_assinatura(_limpar(linha)))
+            for assinatura in vistas:
+                paginas[assinatura].append(numero)
+            palavras.update(p.lower() for p in re.findall(r"[^\W\d_]+", bruto))
+            hifenizadas.update(p.lower() for p in
+                               re.findall(r"[^\W\d_]+-[^\W\d_]+", bruto))
+        self._vocabulario = palavras
+        self._hifenizadas = hifenizadas
+        for assinatura, onde in paginas.items():
+            if (len(onde) >= 3 and len(assinatura.split()) >= 2
+                    and not assinatura.endswith((".", "?", "!", ":"))
+                    and not _RE_ROTULO_DE_SECAO.match(assinatura)
+                    and len(onde) / (onde[-1] - onde[0] + 1) >= 0.3):
+                self.recorrentes_corpo.add(assinatura)
+        self._re_cabecalhos = None
+
+    # Quem vem depois do hifen e faz parte da palavra: pronome ("omiti-lo")
+    # ou segundo elemento de composto ("segunda-feira", "palavra-chave").
+    _DEPOIS_DO_HIFEN = {"lo", "la", "los", "las", "se", "me", "te", "nos", "vos",
+                        "lhe", "lhes", "no", "na", "o", "a", "os", "as", "feira",
+                        "chave", "fonte", "texto", "mail", "book"}
+    # Prefixos e primeiros elementos que levam hifen de verdade.
+    _ANTES_DO_HIFEN = {"bem", "mal", "pre", "pré", "pos", "pós", "pro", "pró", "ex",
+                       "vice", "auto", "anti", "sub", "super", "semi", "micro",
+                       "macro", "multi", "pseudo", "recem", "recém", "alem", "além",
+                       "sem", "guarda", "porta", "meio", "mini", "co", "inter",
+                       "segunda", "terca", "terça", "quarta", "quinta", "sexta"}
+
     def _desfazer_hifen_interno(self, texto):
+        """Hifen de quebra de linha do livro original que virou texto.
+
+        "pecu-liaridades", "co-meçar": a palavra so aparece partida uma vez.
+        Junta quando o livro tem a palavra inteira em outro lugar OU quando o
+        hifenizado e unico e nao e pronome, prefixo ou composto conhecido.
+        """
         if self._vocabulario is None:
-            palavras = Counter()
-            for numero in range(len(self.doc)):
-                try:
-                    bruto = self.doc.load_page(numero).get_text("text")
-                except Exception:
-                    continue
-                palavras.update(p.lower() for p in re.findall(r"[^\W\d_]+", bruto))
-            self._vocabulario = palavras
+            self._varrer_livro_inteiro()
+        hifenizadas = getattr(self, "_hifenizadas", Counter())
 
         def trocar(m):
             a, b = m.group(1), m.group(2)
-            if b[:1].islower() and self._vocabulario.get((a + b).lower(), 0) >= 1:
+            if not b[:1].islower():
+                return m.group(0)
+            if self._vocabulario.get((a + b).lower(), 0) >= 1:
+                return a + b
+            if (len(a) >= 2 and len(b) >= 3
+                    and b.lower() not in self._DEPOIS_DO_HIFEN
+                    and a.lower() not in self._ANTES_DO_HIFEN
+                    and hifenizadas.get(f"{a}-{b}".lower(), 0) <= 1):
                 return a + b
             return m.group(0)
+        # "cha-50 ... mado": o numero da pagina caiu dentro da palavra.
+        texto = re.sub(r"([^\W\d_])-\s?\d{1,3}\b(?![.,]\d)", r"\1-", texto)
+        # Hifen seguido de espaco e minuscula: sempre quebra de linha.
+        texto = re.sub(r"([^\W\d_]{2,})-\s+([a-zà-ÿ]{2,})", r"\1\2", texto)
         return re.sub(r"([^\W\d_]+)-([^\W\d_]+)", trocar, texto)
 
     # ------------------------------------------------------------ ordem leitura

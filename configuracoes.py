@@ -9,7 +9,7 @@ import os
 from core.paths import migrar_dados_locais, user_path
 
 APP_NOME = "Lumina"
-APP_VERSAO = "2.3.3"
+APP_VERSAO = "2.3.4"
 
 # ---------------------------------------------------------------- ARMAZENAMENTO
 migrar_dados_locais(
