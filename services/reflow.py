@@ -517,7 +517,9 @@ _RE_PREFIXO_CODIGO = re.compile(
     # \b depois das palavras: sem ele, "importante" e "variavel" casavam.
     r"^(?:(?:var|let|const|function|return|else|import|export|def|class)\b|print\(|"
     r"if\s*\(|for\s*\(|while\s*\(|switch\s*\(|document\.|console\.|window\.|"
-    r"alert\(|prompt\(|confirm\(|parseInt\(|parseFloat\(|Math\.|</?[a-zA-Z][\w-]*[\s>/])")
+    r"alert\(|prompt\(|confirm\(|parseInt\(|parseFloat\(|Math\.|</?[a-zA-Z][\w-]*[\s>/]|"
+    # Prompts de Python/IPython/terminal ("In [3]: df.head()", ">>> x = 1", "$ pip").
+    r"(?:In|Out)\s*\[\d*\]:|>>>\s|\$\s+\w|from\s+\w+(?:\.\w+)*\s+import\s)")
 _RE_SO_PONTUACAO_CODIGO = re.compile(r"^[\"'`)\]};,+\s]{1,8}$")
 _RE_CHAMADA_OU_ATRIBUICAO = re.compile(r"^[\w.$\[\]]+\s*(?:=|\+=|-=|\+\+|--|\()")
 
@@ -543,6 +545,80 @@ def _frase_interrompida(texto_a, texto_b) -> bool:
 _RE_ROTULO_DE_SECAO = re.compile(
     r"^(?:cap[ií]tulo|chapter|parte|part|livro|se[cç][aã]o|section|aula|li[cç][aã]o)\s+#\.?$",
     re.IGNORECASE)
+
+_RE_PROMPT_OU_DADO = re.compile(r"(?:In|Out)\s*\[\s*\d*\s*\]|>>>|^\s*[-\d.]+(?:\s+[-\d.NaN]+){1,}\s*$")
+
+
+def _linha_ocr_de_codigo(linha) -> bool:
+    """Linha reconhecida pelo OCR que e codigo, saida de console ou tabela.
+
+    Prosa tem ~80% de letras; codigo e numeros tem bem menos, e trazem
+    prompts (In [3]:, >>>), chamadas ou simbolos de programacao.
+    """
+    texto = linha.strip()
+    sem_espaco = [c for c in texto if not c.isspace()]
+    # Numero sozinho e numero de pagina: segue para o texto, onde a regra de
+    # rodape o descarta (como recorte ele aparecia no meio da leitura).
+    if len(sem_espaco) < 3 or _RE_SO_NUMERO.match(texto):
+        return False
+    letras = sum(c.isalpha() for c in sem_espaco) / len(sem_espaco)
+    simbolos = sum(c in "=()[]{}'\"_<>:;,." for c in sem_espaco) / len(sem_espaco)
+    palavras = texto.split()
+    numeros = sum(1 for p in palavras if any(c.isdigit() for c in p))
+    return (_parece_linha_de_codigo(texto) or bool(_RE_PROMPT_OU_DADO.search(texto))
+            or letras < 0.6
+            or (simbolos >= 0.18 and len(palavras) <= 6)
+            # linha de tabela: varios numeros soltos entre poucas palavras
+            or (numeros >= 2 and numeros >= len(palavras) * 0.3))
+
+
+def _absorver_fragmentos(trechos):
+    """Fragmento curto sem cara de frase, colado a codigo, vai junto pro recorte.
+
+    "dtype: float64", "c NaN", "df" sobravam como paragrafos de uma palavra
+    entre dois recortes -- sao o fim da saida do console.
+    """
+    def curto(bloco):
+        textos = [_texto_da_linha(l).strip() for l in bloco.get("lines", [])]
+        total = " ".join(textos)
+        return (len(textos) <= 2 and len(total) <= 40
+                and not total.rstrip().endswith((".", "!", "?", ":")))
+    marcas = [eh for eh, _b in trechos]
+    for i, (eh, bloco) in enumerate(trechos):
+        if eh or not curto(bloco):
+            continue
+        vizinho_codigo = ((i > 0 and marcas[i - 1]) or
+                          (i + 1 < len(marcas) and marcas[i + 1]))
+        if vizinho_codigo:
+            marcas[i] = True
+    return [(m, b) for m, (_eh, b) in zip(marcas, trechos)]
+
+
+def _trechos_do_bloco_ocr(bloco):
+    """[(eh_codigo, bloco)] partindo o bloco do OCR onde prosa e codigo trocam.
+
+    Linha de prosa ISOLADA entre codigo (comentario curto, "pelas colunas:")
+    fica com o texto; uma de codigo isolada entre prosa ("'dwarf')") vai para
+    o recorte -- o recorte mostra a linha como impressa, sem perder nada.
+    """
+    linhas = [l for l in bloco.get("lines", []) if _texto_da_linha(l).strip()]
+    if not linhas:
+        return []
+    marcas = [_linha_ocr_de_codigo(_texto_da_linha(l)) for l in linhas]
+    trechos = []
+    for linha, marca in zip(linhas, marcas):
+        if trechos and trechos[-1][0] == marca:
+            trechos[-1][1].append(linha)
+        else:
+            trechos.append((marca, [linha]))
+    saida = []
+    for marca, grupo in trechos:
+        caixa = grupo[0]["bbox"]
+        for linha in grupo[1:]:
+            caixa = _uniao(caixa, linha["bbox"])
+        saida.append((marca, dict(bloco, bbox=caixa, lines=grupo)))
+    return saida
+
 
 _RE_TITULO_NUMERADO = re.compile(r"^(\d{1,2}(?:\.\d{1,2})+)\.?\s+([A-ZÁÉÍÓÚÂÊÔÃÕÇ].*)$")
 # Inclui palavra de uma letra: "...de futebol O nosso grande rival".
@@ -790,6 +866,10 @@ class MotorReflow:
         self.imagens_recorrentes = set()
         # Livro que perdeu a estrutura na conversao (ver _analisar).
         self.corpo_negrito = False
+        # Livro de texto escaneado (paginas so com imagem, mas o OCR le
+        # paragrafos nelas): ver _sondar_escaneado.
+        self.escaneado_com_texto = False
+        self._amostra_ocr = ""
         self.recorrentes_corpo = set()
         self.codigo_por_conteudo = False
         self._vocabulario = None
@@ -826,6 +906,36 @@ class MotorReflow:
             return None
         return self._votos_lingua.most_common(1)[0][0]
 
+    def _sondar_escaneado(self):
+        """Paginas so com imagem: e quadrinho ou livro de texto escaneado?
+
+        Reconhece duas paginas do miolo. Se as duas derem paragrafos de
+        verdade, e livro de texto -- o leitor reflui pelo OCR em vez de
+        mostrar a foto da pagina. Pagina ja reconhecida vem do disco.
+        """
+        if not self.ocr_ativo or len(self.doc) < 4:
+            return
+        try:
+            from services import ocr
+            if not ocr.disponivel():
+                return
+            total = len(self.doc)
+            textos, linhas_codigo = [], []
+            for numero in (total // 3, total // 2, (total * 2) // 3):
+                blocos = ocr.blocos_da_pagina(self.doc.load_page(numero), self.tamanho_corpo)
+                linhas = [_texto_da_linha(l) for b in blocos for l in b.get("lines", [])]
+                textos.append(" ".join(linhas))
+                linhas_codigo += [l for l in linhas if _parece_linha_de_codigo(l)]
+            if sum(len(t) >= 600 and ocr.parece_texto(t) for t in textos) >= 2:
+                self.escaneado_com_texto = True
+                self._amostra_ocr = "\n".join(linhas_codigo) or "\n".join(textos)
+                # O OCR nao sabe que fonte era monoespacada: o codigo do livro
+                # escaneado e reconhecido pelo conteudo, como no Calibre.
+                if len(linhas_codigo) >= 4:
+                    self.codigo_por_conteudo = True
+        except Exception as erro:
+            print(f"[Reflow] Sondagem de OCR falhou: {erro}")
+
     def _classificar_renderizacao(self):
         """Escolhe COMO o livro deve ser exibido, nao sobre o que ele fala.
 
@@ -834,8 +944,15 @@ class MotorReflow:
         nunca o titulo -- "Calculo I" pode ser uma apostila digitalizada e
         "Django" pode nao ter uma linha de codigo em texto.
         """
-        # Quase sem texto e quase tudo imagem: quadrinho, album, scan.
+        # Quase sem texto e quase tudo imagem: quadrinho, album -- ou um livro
+        # de TEXTO escaneado. Este ultimo nao e HQ: com OCR ele vira texto de
+        # verdade, e o modo sai do assunto que o reconhecimento revelou.
         if self.fracao_pag_ilustradas >= 0.6 and self.chars_por_pagina < 700:
+            if self.escaneado_com_texto:
+                pontos = realce.pontuar(self._amostra_ocr[:4000]) if self._amostra_ocr else {}
+                if self.codigo_por_conteudo or (pontos and max(pontos.values()) >= 8):
+                    return "programacao"
+                return "prosa"
             return "hq"
         # Muita figura + duas colunas + texto medio: revista/diagramacao rica,
         # que o reflow destruiria.
@@ -1125,6 +1242,8 @@ class MotorReflow:
             self.fracao_pag_ilustradas = paginas_com_muita_imagem / paginas_validas
             self.fracao_duas_colunas = paginas_duas_colunas / paginas_validas
             self.chars_por_pagina = chars_todos / paginas_validas
+        if self.fracao_pag_ilustradas >= 0.6 and self.chars_por_pagina < 700:
+            self._sondar_escaneado()
         self.render_detectado = self._classificar_renderizacao()
 
     # ---------------------------------------------------------------- extracao
@@ -1176,8 +1295,46 @@ class MotorReflow:
                 try:
                     from services import ocr
                     if ocr.disponivel():
+                        # Codigo e tabela o OCR pica em pedacos ("In [45]:" de
+                        # um lado, "'dwarf')" do outro): esses trechos entram
+                        # como RECORTE da pagina, exatamente como impressos. O
+                        # texto corrido continua texto (busca, grifo, voz).
+                        grupo = None
+                        # Linha a linha: o OCR junta prosa e codigo no mesmo
+                        # bloco. Cada trecho continuo de codigo vira recorte;
+                        # cada trecho de prosa vira um bloco de texto.
+                        trechos = []
                         for bloco in ocr.blocos_da_pagina(pagina, self.tamanho_corpo):
+                            trechos.extend(_trechos_do_bloco_ocr(bloco))
+                        for eh_codigo, bloco in _absorver_fragmentos(trechos):
+                            if eh_codigo:
+                                caixa = bloco["bbox"]
+                                grupo = caixa if grupo is None else _uniao(grupo, caixa)
+                                continue
+                            if grupo is not None:
+                                recorte = self._recortar(pagina, grupo)
+                                if recorte is not None:
+                                    reconhecidos.append(recorte)
+                                grupo = None
                             reconhecidos.extend(self._blocos_do_bloco(bloco, altura))
+                        if grupo is not None:
+                            recorte = self._recortar(pagina, grupo)
+                            if recorte is not None:
+                                reconhecidos.append(recorte)
+                        # O OCR parte o paragrafo em blocos ("...o nivel" |
+                        # "desempilhado passa a ser..."): junta de volta.
+                        unidos = []
+                        for item in reconhecidos:
+                            anterior = unidos[-1] if unidos else None
+                            if (anterior is not None and anterior.tipo == "paragrafo"
+                                    and item.tipo == "paragrafo" and anterior.texto
+                                    and item.texto
+                                    and _frase_interrompida(anterior.texto, item.texto)):
+                                anterior.texto = anterior.texto.rstrip() + " " + item.texto.lstrip()
+                                anterior.hifen_final = item.hifen_final
+                                continue
+                            unidos.append(item)
+                        reconhecidos = unidos
                         texto = "\n\n".join(b.texto for b in reconhecidos if b.texto)
                         # Pouco texto ou letras soltas: foto, ilustracao ou
                         # quadrinho -- a imagem original e mais fiel.
@@ -1186,8 +1343,11 @@ class MotorReflow:
                 except Exception:
                     reconhecidos = []
                 if reconhecidos:
-                    resultado.blocos.append(Bloco(
-                        "aviso", "Texto reconhecido por OCR — pode conter erros."))
+                    # No livro escaneado inteiro o aviso a cada pagina poluia o
+                    # texto corrido: ali ele aparece so na primeira pagina.
+                    if not self.escaneado_com_texto or numero == 0:
+                        resultado.blocos.append(Bloco(
+                            "aviso", "Texto reconhecido por OCR — pode conter erros."))
                     resultado.blocos.extend(reconhecidos)
                     resultado.texto_puro = texto
                     resultado.palavras = len(texto.split())
@@ -1659,6 +1819,13 @@ class MotorReflow:
                     return []
                 if _RE_SO_NUMERO.match(inteiro):    # numero de pagina solto
                     return []
+        # Livro escaneado: nao ha texto nativo para comparar paginas, entao a
+        # linha curta no topo/pe da pagina e tratada como cabecalho/rodape
+        # ("PYTHON PARA ANALISE DE DADOS: ...", "Capitulo 2", "87").
+        if (self.escaneado_com_texto and len(linhas) <= 2
+                and (y1 < altura_pagina * 0.10 or y0 > altura_pagina * 0.92)
+                and len(_limpar(" ".join(l["texto"] for l in linhas))) <= 120):
+            return []
 
         alturas = [l["y1"] - l["y0"] for l in linhas if l["y1"] > l["y0"]]
         altura_media = statistics.median(alturas) if alturas else self.tamanho_corpo
@@ -1686,8 +1853,11 @@ class MotorReflow:
                 anterior["x1"] >= x1_bloco - largura_bloco * 0.12
                 and not anterior["texto"].rstrip().endswith((".", "!", "?", ":")))
             # 2. Mudanca real de corpo tipografico (titulo comecando).
+            #    No escaneado o tamanho e ESTIMADO pelo OCR e oscila de linha
+            #    para linha: ali so salto grande (titulo de verdade) quebra.
+            limite_tamanho = 0.45 if self.escaneado_com_texto else 0.12
             if (not continua_frase and abs(linha["tamanho"] - anterior["tamanho"])
-                    > max(0.8, anterior["tamanho"] * 0.12)):
+                    > max(0.8, anterior["tamanho"] * limite_tamanho)):
                 quebra = True
             # 3. Peso muda de normal para negrito e vice-versa.
             if not continua_frase and (linha["negrito"] > 0.6) != (anterior["negrito"] > 0.6):
@@ -1787,6 +1957,13 @@ class MotorReflow:
         if _RE_MARCADOR.match(texto):
             return Bloco("lista", texto, mono=faixas_mono, hifen_final=hifen_final)
 
+        # Escaneado: o tamanho vem estimado do OCR. Titulo so com letra bem
+        # maior, linha unica e curta -- senao "ou axis=1 faz a soma" virava
+        # titulo so porque a estimativa daquela linha saiu alta.
+        if self.escaneado_com_texto:
+            if tamanho >= corpo * 1.5 and len(linhas) == 1 and len(texto) <= 70:
+                return Bloco("titulo", texto, nivel=2)
+            return Bloco("paragrafo", texto, mono=faixas_mono, hifen_final=hifen_final)
         if tamanho >= corpo * 1.55:
             return Bloco("titulo", texto, nivel=1)
         if tamanho >= corpo * 1.22:

@@ -648,6 +648,22 @@ class TelaLeitor(ctk.CTkFrame):
         self.ativar_atalhos()
         self._atualizar_status_ia()
         self.renderizar()
+        # Livro de texto escaneado: o resto do livro e reconhecido em fundo, a
+        # partir da pagina atual, para as proximas paginas ja virem prontas.
+        if getattr(self.motor, "escaneado_com_texto", False):
+            # Sem texto nativo a amostra conta zero palavras e o "tempo
+            # restante" dizia 3 min para 900 paginas: usa as do OCR.
+            amostra = getattr(self.motor, "_amostra_ocr", "")
+            if self.media_palavras < 50:
+                self.media_palavras = max(250, len(amostra.split()) // 3)
+                self._atualizar_rodape()
+            try:
+                from services import ocr
+                ocr.reconhecer_em_segundo_plano(livro["caminho_pdf"], self.pagina_atual)
+                C.Toast.mostrar(self, "Livro escaneado: o texto esta sendo reconhecido "
+                                      "em segundo plano (OCR).", "info", 3200)
+            except Exception as erro:
+                print(f"[Leitor] OCR em fundo: {erro}")
         # EPUB ainda sem paginacao guardada (importado antes desta versao):
         # prepara agora, em outro processo. A partir da proxima abertura ele
         # abre na hora e as tarefas de fundo deixam de travar a leitura.

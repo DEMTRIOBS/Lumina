@@ -20,6 +20,18 @@ if __name__ == "__main__" and len(sys.argv) >= 4 and sys.argv[1] == "--paginar-e
     converter_epub(sys.argv[2], sys.argv[3])
     sys.exit(0)
 
+# Processo auxiliar: reconhecer (OCR) um livro escaneado inteiro para o cache
+# em disco, em prioridade baixa (ver services/ocr.py, reconhecer_livro).
+if __name__ == "__main__" and len(sys.argv) >= 3 and sys.argv[1] == "--ocr-livro":
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except Exception:
+        pass
+    from services.ocr import reconhecer_livro
+    reconhecer_livro(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 0)
+    sys.exit(0)
+
 import tkinter as tk  # noqa: E402
 
 import customtkinter as ctk
@@ -546,6 +558,13 @@ class App(ctk.CTk, _MixinDnD):
                 self.banco_config.definir("geometria", self.geometry())
         except Exception as erro:
             print(f"[App] Erro ao salvar janela: {erro}")
+        try:
+            # Reconhecimento de livro escaneado em fundo: para junto. As
+            # paginas prontas ficam no disco e ele retoma na proxima abertura.
+            from services import ocr
+            ocr.encerrar_processos()
+        except Exception:
+            pass
         try:
             leitor = self.telas.get("leitor")
             if leitor is not None:

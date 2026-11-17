@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.4 — 2026-11-17
+
+### Livros escaneados viram texto
+- Livro so de imagens nao vai mais direto para o modo HQ: o Lumina reconhece
+  3 paginas de amostra e, se ha paragrafos de verdade, le o livro como texto
+  (OCR do Windows), no modo do assunto (programacao, prosa...).
+- **Modo hibrido:** texto corrido vira texto (justifica, busca, grifa, le em
+  voz alta); codigo, saida de console e tabelas aparecem como RECORTE fiel da
+  pagina, recolorido para o tema -- o OCR picava essas listagens.
+- O livro inteiro e reconhecido em segundo plano, num processo de prioridade
+  baixa, a partir da pagina atual (~0,3 s por pagina). Cada pagina vai para o
+  disco e nunca mais e refeita; ao fechar o app o processo para e retoma na
+  proxima abertura.
+- Cabecalho e numero de pagina do escaneado sao descartados; paragrafos
+  partidos pelo OCR sao juntados; titulo so com letra bem maior (o tamanho
+  estimado pelo OCR oscila); tempo restante calculado pelas palavras do OCR.
+
 ## 2.3.4 — 2026-11-17
 
 Livros convertidos pelo Calibre (continuacao):

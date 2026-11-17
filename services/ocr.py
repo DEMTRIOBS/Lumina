@@ -179,13 +179,150 @@ def _reconhecer(pagina) -> list:
     return linhas
 
 
+# ------------------------------------------------------------- CACHE EM DISCO
+# Reconhecer custa ~300 ms por pagina; um livro escaneado de 900 paginas
+# seriam 4-5 minutos de CPU a cada leitura. Cada pagina reconhecida vai para
+# o disco (um JSON pequeno por pagina) e nunca mais e refeita. E o mesmo
+# cache que o processo de fundo (`reconhecer_livro`) preenche.
+_VERSAO_CACHE = "v1"
+
+
+def _pasta_do_livro(doc):
+    pasta = getattr(doc, "_lumina_pasta_ocr", None)
+    if pasta is not None:
+        return pasta
+    pasta = ""
+    try:
+        import os
+        from configuracoes import user_path
+        from services.pdf_service import PDFService
+        nome = getattr(doc, "name", "") or ""
+        if nome and os.path.exists(nome):
+            ident = PDFService.gerar_id_unico(nome)
+            pasta = os.path.join(user_path("ocr_cache"), f"{ident}_{_VERSAO_CACHE}")
+            os.makedirs(pasta, exist_ok=True)
+    except Exception:
+        pasta = ""
+    try:
+        doc._lumina_pasta_ocr = pasta
+    except Exception:
+        pass
+    return pasta
+
+
+def _ler_disco(doc, numero):
+    import json
+    import os
+    pasta = _pasta_do_livro(doc)
+    if not pasta:
+        return None
+    arquivo = os.path.join(pasta, f"{numero}.json")
+    try:
+        with open(arquivo, encoding="utf-8") as f:
+            return [{"palavras": [(t, tuple(c)) for t, c in linha]} for linha in json.load(f)]
+    except Exception:
+        return None
+
+
+def _gravar_disco(doc, numero, linhas):
+    import json
+    import os
+    pasta = _pasta_do_livro(doc)
+    if not pasta:
+        return
+    arquivo = os.path.join(pasta, f"{numero}.json")
+    try:
+        temporario = arquivo + ".tmp"
+        with open(temporario, "w", encoding="utf-8") as f:
+            json.dump([[(t, [round(v, 1) for v in c]) for t, c in l["palavras"]]
+                       for l in linhas], f, ensure_ascii=False)
+        os.replace(temporario, arquivo)
+    except Exception:
+        pass
+
+
+def pagina_pronta(doc, numero) -> bool:
+    import os
+    pasta = _pasta_do_livro(doc)
+    return bool(pasta) and os.path.exists(os.path.join(pasta, f"{numero}.json"))
+
+
+def reconhecer_livro(caminho, primeira=0):
+    """Reconhece o livro inteiro para o cache em disco (processo de fundo).
+
+    Comeca pela pagina em que a pessoa esta e segue ate o fim; depois volta
+    ao comeco. Pagina ja reconhecida e pulada -- o processo pode ser
+    interrompido e retomado sem perder nada.
+    """
+    from services.pdf_service import abrir
+    # Cria o motor de OCR deste processo (sem isto cada pagina falhava em
+    # silencio e o processo terminava sem reconhecer nada).
+    if not disponivel():
+        return
+    doc = abrir(caminho)
+    total = len(doc)
+    ordem = list(range(primeira, total)) + list(range(0, primeira))
+    for numero in ordem:
+        if pagina_pronta(doc, numero):
+            continue
+        try:
+            _linhas_em_cache(doc.load_page(numero))
+        except Exception:
+            continue
+
+
+_processos_ocr = {}
+
+
+def reconhecer_em_segundo_plano(caminho, primeira=0):
+    """Dispara `reconhecer_livro` num processo a parte, em prioridade baixa.
+
+    Processo e nao thread: o reconhecimento segura o Python enquanto roda, e
+    numa thread a janela pararia a cada pagina. Um processo por livro.
+    """
+    import os
+    import subprocess
+    import sys
+    anterior = _processos_ocr.get(caminho)
+    if anterior is not None and anterior.poll() is None:
+        return
+    if getattr(sys, "frozen", False):
+        comando = [sys.executable, "--ocr-livro", caminho, str(int(primeira))]
+    else:
+        raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        comando = [sys.executable, os.path.join(raiz, "main.py"), "--ocr-livro",
+                   caminho, str(int(primeira))]
+    ambiente = dict(os.environ, PYINSTALLER_SUPPRESS_SPLASH_SCREEN="1")
+    sem_janela = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    prioridade_baixa = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+    try:
+        _processos_ocr[caminho] = subprocess.Popen(
+            comando, env=ambiente, creationflags=sem_janela | prioridade_baixa)
+    except Exception as erro:
+        print(f"[OCR] Nao foi possivel iniciar o reconhecimento de fundo: {erro}")
+
+
+def encerrar_processos():
+    """Para os reconhecimentos de fundo (ao fechar o programa)."""
+    for processo in list(_processos_ocr.values()):
+        try:
+            if processo.poll() is None:
+                processo.terminate()
+        except Exception:
+            pass
+    _processos_ocr.clear()
+
+
 def _linhas_em_cache(pagina) -> list:
     doc = pagina.parent
     chave = (id(doc), getattr(doc, "name", ""), len(doc), pagina.number)
     if chave in _cache:
         _cache.move_to_end(chave)
         return _cache[chave]
-    linhas = _reconhecer(pagina)
+    linhas = _ler_disco(doc, pagina.number)
+    if linhas is None:
+        linhas = _reconhecer(pagina)
+        _gravar_disco(doc, pagina.number, linhas)
     _cache[chave] = linhas
     while len(_cache) > _CACHE_MAX:
         _cache.popitem(last=False)
