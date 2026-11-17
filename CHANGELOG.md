@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.3.2 — 2026-11-17
+
+### Livros que perderam a estrutura na conversao
+PDFs gerados pelo Calibre a partir de e-book chegam com o livro inteiro numa
+fonte so, sem fonte de codigo, e com cabecalho, rodape e marca d'agua do
+original virados texto corrido. Agora o motor reconhece esse caso e:
+- nao toma mais o negrito do corpo por titulo (o texto saia picado);
+- remove linhas que se repetem em metade das paginas em qualquer posicao
+  (numero de pagina, "Casa do Codigo", marca d'agua com nome e e-mail),
+  inclusive coladas no meio de um paragrafo;
+- reconstroi titulos pela forma ("1.8" + frase, "Capitulo 2" + nome);
+- reconhece codigo pelo conteudo (`var ano = 2012;`, `document.write(...)`);
+- junta paragrafos partidos pelo conversor (frase sem ponto + minuscula);
+- desfaz hifens de quebra de linha que viraram texto ("pa-renteses"),
+  quando o livro usa a palavra inteira em outro lugar.
+
 ## 2.3.1 — 2026-11-16
 
 ### Travamentos corrigidos

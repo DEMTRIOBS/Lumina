@@ -506,6 +506,44 @@ def _eh_matematica(span) -> bool:
     return any(x in nome for x in _FONTES_MATEMATICA)
 
 
+def _eh_negrito(span) -> bool:
+    return bool(span.get("flags", 0) & 16) or "bold" in span.get("font", "").lower()
+
+
+# Linha que parece codigo PELO CONTEUDO. Serve para livros em que o codigo
+# perdeu a fonte monoespacada (PDF gerado pelo Calibre a partir de e-book:
+# o livro inteiro numa fonte so).
+_RE_PREFIXO_CODIGO = re.compile(
+    # \b depois das palavras: sem ele, "importante" e "variavel" casavam.
+    r"^(?:(?:var|let|const|function|return|else|import|export|def|class)\b|print\(|"
+    r"if\s*\(|for\s*\(|while\s*\(|switch\s*\(|document\.|console\.|window\.|"
+    r"alert\(|prompt\(|confirm\(|parseInt\(|parseFloat\(|Math\.|</?[a-zA-Z][\w-]*[\s>/])")
+_RE_SO_PONTUACAO_CODIGO = re.compile(r"^[\"'`)\]};,+\s]{1,8}$")
+_RE_CHAMADA_OU_ATRIBUICAO = re.compile(r"^[\w.$\[\]]+\s*(?:=|\+=|-=|\+\+|--|\()")
+
+
+def _parece_linha_de_codigo(texto) -> bool:
+    linha = (texto or "").strip()
+    if not linha or len(linha) > 110:
+        return False
+    if _RE_PREFIXO_CODIGO.match(linha) or _RE_SO_PONTUACAO_CODIGO.match(linha):
+        return True
+    return bool(_RE_CHAMADA_OU_ATRIBUICAO.match(linha)
+                and linha.endswith((";", "{", "}", ")")))
+
+
+def _frase_interrompida(texto_a, texto_b) -> bool:
+    """A termina no meio da frase e B a continua (minuscula no comeco)."""
+    a = (texto_a or "").rstrip()
+    b = (texto_b or "").lstrip().lstrip("\"'“‘«(")
+    return bool(a) and a[-1] not in ".!?:;\"'”»)" and b[:1].islower() \
+        and not _parece_linha_de_codigo(a) and not _parece_linha_de_codigo(b)
+
+
+_RE_NUM_SECAO = re.compile(r"^\d{1,2}(?:\.\d{1,3})+\.?$")
+_RE_CAPITULO = re.compile(r"^(?:cap[ií]tulo|chapter)\s+\d{1,3}$", re.IGNORECASE)
+
+
 def _eh_mono(span) -> bool:
     nome = span.get("font", "").lower()
     if any(x in nome for x in _FONTES_NAO_MONO):
@@ -640,6 +678,12 @@ class MotorReflow:
         # Logotipos e marcas d'agua: imagem que reaparece no mesmo lugar e no
         # mesmo tamanho pagina apos pagina nunca e ilustracao.
         self.imagens_recorrentes = set()
+        # Livro que perdeu a estrutura na conversao (ver _analisar).
+        self.corpo_negrito = False
+        self.recorrentes_corpo = set()
+        self.codigo_por_conteudo = False
+        self._vocabulario = None
+        self._re_cabecalhos = None
         self.predominante_latino = True
         # Perfil do livro: manda no realce de codigo e nas mencoes inline.
         # Sem isso, um romance com uma fonte mal marcada como monoespacada
@@ -755,7 +799,13 @@ class MotorReflow:
         indices = list(range(0, total, passo))[:amostra_max]
 
         pesos_tamanho = Counter()
+        pesos_negrito = Counter()
         contagem_margem = Counter()
+        # Linhas que se repetem em qualquer POSICAO da pagina: cabecalho e
+        # rodape que viraram texto corrido (PDF do Calibre: "15", "Casa do
+        # Codigo", marca d'agua com o nome de quem comprou o e-book).
+        contagem_corpo = Counter()
+        linhas_codigo = []
         contagem_imagem = Counter()
         paginas_validas = 0
         latinas = impossiveis = 0
@@ -783,6 +833,7 @@ class MotorReflow:
             largura_pag = dados.get("width") or pagina.rect.width or 1
             paginas_validas += 1
             vistos_nesta = set()
+            vistos_corpo = set()
             imagens_nesta = set()
 
             area_pagina += largura_pag * altura
@@ -809,6 +860,11 @@ class MotorReflow:
                 for linha in bloco.get("lines", []):
                     texto_linha = _texto_da_linha(linha)
                     texto_bloco.append(texto_linha)
+                    limpa = texto_linha.strip()
+                    if limpa and len(limpa) <= 90:
+                        vistos_corpo.add(_normalizar_assinatura(_limpar(limpa)))
+                    if len(linhas_codigo) < 600 and _parece_linha_de_codigo(limpa):
+                        linhas_codigo.append(limpa)
                     if texto_linha.strip() and not na_margem and len(linhas_info) < 6000:
                         tam, negr, _m = _metricas_da_linha(linha)
                         linhas_info.append((tam or 0, negr, texto_linha.strip()))
@@ -817,6 +873,8 @@ class MotorReflow:
                         n = len(conteudo.strip())
                         if n:
                             pesos_tamanho[round(span.get("size", 0), 1)] += n
+                            if _eh_negrito(span):
+                                pesos_negrito[round(span.get("size", 0), 1)] += n
                             chars_todos += n
                             if _eh_mono(span):
                                 chars_mono += n
@@ -840,12 +898,19 @@ class MotorReflow:
 
             for assinatura in vistos_nesta:
                 contagem_margem[assinatura] += 1
+            for assinatura in vistos_corpo:
+                contagem_corpo[assinatura] += 1
             for assinatura in imagens_nesta:
                 contagem_imagem[assinatura] += 1
 
         if pesos_tamanho:
             # O tamanho que cobre mais caracteres e, por definicao, o corpo.
             self.tamanho_corpo = max(pesos_tamanho.items(), key=lambda kv: kv[1])[0]
+            # Corpo do texto TODO em negrito: o negrito deixa de ser sinal de
+            # titulo. Sem isto, qualquer linha curta virava titulo e o texto
+            # saia picado.
+            self.corpo_negrito = (pesos_negrito[self.tamanho_corpo]
+                                  > pesos_tamanho[self.tamanho_corpo] * 0.6)
             # Titulo = maior que o corpo REAL. Medido durante o laco, o corpo
             # ainda era o padrao de 11 pt: um livro em 14 pt virava "tecnico"
             # (tudo parecia titulo) e um em 9 pt perdia os titulos de verdade.
@@ -864,6 +929,17 @@ class MotorReflow:
             # O limiar da imagem e mais alto que o do texto: cabecalho se repete
             # em toda pagina, mas uma ilustracao legitima pode reaparecer em
             # varias (o mesmo diagrama retomado a cada secao de um capitulo).
+            # Repetidas em metade das paginas, em qualquer lugar delas. So
+            # frases (2+ palavras) -- "Exemplo:" pode se repetir de verdade --
+            # e numero solto apenas quando o livro perdeu a estrutura.
+            from services.pdf_service import veio_de_epub as _de_epub
+            if paginas_validas >= 8 and not _de_epub(self.doc):
+                minimo_corpo = max(4, int(paginas_validas * 0.5))
+                self.recorrentes_corpo = {
+                    a for a, c in contagem_corpo.items()
+                    if c >= minimo_corpo and (len(a.split()) >= 2
+                                              or (self.corpo_negrito and not any(
+                                                  ch.isalpha() for ch in a)))}
             minimo_img = max(3, int(paginas_validas * _LIMIAR_IMAGEM_RECORRENTE))
             self.imagens_recorrentes = {a for a, c in contagem_imagem.items()
                                         if c >= minimo_img}
@@ -881,6 +957,17 @@ class MotorReflow:
         texto_mono = " ".join(amostra_mono)[:4000]
         pontos = realce.pontuar(texto_mono)
         self.pontuacao_codigo = max(pontos.values()) if pontos else 0.0
+        # Sem fonte monoespacada nenhuma, mas com linhas que sao claramente
+        # codigo ("var ano = 2012;", "document.write(...)"): o codigo perdeu
+        # a fonte na conversao. Passa a ser reconhecido pelo conteudo.
+        if (self.fracao_mono < 0.002 and paginas_validas
+                and len(linhas_codigo) >= max(6, paginas_validas * 0.3)):
+            amostra = "\n".join(linhas_codigo)[:4000]
+            pontos_conteudo = realce.pontuar(amostra)
+            if pontos_conteudo and max(pontos_conteudo.values()) >= 8:
+                self.codigo_por_conteudo = True
+                self.pontuacao_codigo = max(pontos_conteudo.values())
+                self.fracao_mono = min(0.5, sum(map(len, linhas_codigo)) / max(1, chars_todos))
         if pontos:
             self._votos_lingua.update(pontos)
         # Sinais que separam COMO o livro deve ser exibido.
@@ -898,6 +985,7 @@ class MotorReflow:
             titulos = sum(1 for tam, negr, txt in linhas_info
                           if len(txt) <= 120 and (tam >= corpo * 1.2
                                                   or (negr > 0.8 and len(txt) <= 80
+                                                      and not self.corpo_negrito
                                                       and not txt.endswith(".")
                                                       and not _RE_AVISO.match(txt))))
             self.titulos_por_pagina = titulos / paginas_validas
@@ -1031,10 +1119,144 @@ class MotorReflow:
 
         _marcar_legendas(paragrafos)
         paragrafos = _limpar_numeracao_de_codigo(paragrafos)
+        if self.corpo_negrito or self.codigo_por_conteudo:
+            paragrafos = self._estrutura_por_conteudo(paragrafos)
         resultado.blocos = paragrafos
         resultado.texto_puro = "\n\n".join(b.texto for b in paragrafos if b.texto)
         resultado.palavras = len(resultado.texto_puro.split())
         return resultado
+
+    # --------------------------------------------- estrutura pelo conteudo
+    def _estrutura_por_conteudo(self, blocos):
+        """Reconstroi titulos, codigo e palavras de um livro sem estrutura.
+
+        Usado so quando o livro perdeu a diagramacao (corpo todo em negrito,
+        codigo sem fonte monoespacada): ai a forma do texto e a unica pista.
+          * "1.8" sozinho + frase curta -> titulo de secao;
+          * "Capitulo 2" + frase curta -> titulo de capitulo;
+          * linhas seguidas que sao codigo -> um bloco de codigo;
+          * "pa-renteses" (hifen da quebra de linha do livro original, que
+            virou texto) -> "parenteses", quando o livro usa a palavra inteira.
+        """
+        def curto(bloco):
+            return (bloco is not None and bloco.tipo in ("paragrafo", "titulo")
+                    and bloco.texto and len(bloco.texto) <= 90
+                    and not bloco.texto.rstrip().endswith("."))
+
+        def eh_codigo(bloco):
+            return (bloco.tipo in ("paragrafo", "titulo", "lista") and bloco.texto
+                    and _parece_linha_de_codigo(bloco.texto))
+
+        saida = []
+        i = 0
+        while i < len(blocos):
+            bloco = blocos[i]
+            texto = (bloco.texto or "").strip()
+            seguinte = blocos[i + 1] if i + 1 < len(blocos) else None
+            if (self.corpo_negrito and bloco.tipo in ("paragrafo", "titulo")
+                    and (_RE_NUM_SECAO.match(texto) or _RE_CAPITULO.match(texto))):
+                nivel = 1 if _RE_CAPITULO.match(texto) else 2
+                titulo, j = texto.rstrip("."), i + 1
+                if curto(seguinte):
+                    titulo += (": " if nivel == 1 else " ") + seguinte.texto.strip()
+                    j += 1
+                    resto = blocos[j] if j < len(blocos) else None
+                    if curto(resto) and resto.texto[:1].islower():
+                        titulo += " " + resto.texto.strip()
+                        j += 1
+                saida.append(Bloco("titulo", titulo, nivel=nivel))
+                i = j
+                continue
+            if self.codigo_por_conteudo and eh_codigo(bloco):
+                linhas = [texto]
+                j = i + 1
+                while j < len(blocos) and eh_codigo(blocos[j]):
+                    proxima = blocos[j].texto.strip()
+                    # '");' sozinho e o fim da linha anterior que o conversor
+                    # partiu (o "<br>" dentro da string sumiu).
+                    if _RE_SO_PONTUACAO_CODIGO.match(proxima):
+                        linhas[-1] += proxima
+                    else:
+                        linhas.append(proxima)
+                    j += 1
+                if j - i >= 2 or _RE_PREFIXO_CODIGO.match(texto):
+                    saida.append(Bloco("codigo", "\n".join(linhas)))
+                    i = j
+                    continue
+            if self.corpo_negrito and bloco.tipo in ("paragrafo", "citacao", "lista") \
+                    and bloco.texto:
+                bloco.texto = self._tirar_cabecalho_colado(bloco.texto)
+                if not bloco.texto:
+                    i += 1
+                    continue
+                if "-" in bloco.texto:
+                    bloco.texto = self._desfazer_hifen_interno(bloco.texto)
+            saida.append(bloco)
+            i += 1
+        return saida
+
+    def _padroes_de_cabecalho(self):
+        if getattr(self, "_re_cabecalhos", None) is None:
+            padroes = []
+            for frase in self.recorrentes_corpo:
+                palavras = frase.split()
+                if len(palavras) < 2:
+                    continue
+                corpo = r"\s+".join(re.escape(p).replace("\\#", r"\d+")
+                                    .replace("#", r"\d+") for p in palavras)
+                padroes.append(corpo)
+            self._re_cabecalhos = [re.compile(p, re.IGNORECASE) for p in padroes]
+        return self._re_cabecalhos
+
+    def _tirar_cabecalho_colado(self, texto):
+        """Cabecalho corrido que o conversor colou no paragrafo.
+
+        "...console do Chrome Casa do Codigo nao havera..." (titulo da secao +
+        nome da editora, no meio da frase) ou um paragrafo que e so isso
+        ("3.2. Utilize uma funcao... Casa do Codigo"). Mencao legitima
+        ("livros na Casa do Codigo.") e seguida de pontuacao, e fica.
+        """
+        for padrao in self._padroes_de_cabecalho():
+            achado = None
+            for achado in padrao.finditer(texto):
+                pass
+            if achado is None:
+                continue
+            fim = achado.end()
+            # Paragrafo curto terminando na frase: e o cabecalho inteiro.
+            if len(texto) <= 170 and not texto[fim:].strip(" .,;:"):
+                return ""
+            # Marca d'agua com e-mail logo depois: sai junto.
+            seguinte = re.match(r"\s*\S*@\S+", texto[fim:])
+            if seguinte:
+                texto = texto[:achado.start()] + texto[fim + seguinte.end():]
+                continue
+            # No meio da frase: sai a frase repetida e o titulo de secao
+            # ("1.7. Conheca e use o console do Chrome") colado antes dela.
+            def tirar(m):
+                return " "
+            secao = r"(?:\d+(?:\.\d+)+\.?\s+[^.!?]{3,90}?\s+)?"
+            texto = re.sub(secao + padrao.pattern + r"(?=\s+[a-zà-ÿ])", tirar, texto,
+                           flags=re.IGNORECASE)
+        return re.sub(r"\s{2,}", " ", texto).strip()
+
+    def _desfazer_hifen_interno(self, texto):
+        if self._vocabulario is None:
+            palavras = Counter()
+            for numero in range(len(self.doc)):
+                try:
+                    bruto = self.doc.load_page(numero).get_text("text")
+                except Exception:
+                    continue
+                palavras.update(p.lower() for p in re.findall(r"[^\W\d_]+", bruto))
+            self._vocabulario = palavras
+
+        def trocar(m):
+            a, b = m.group(1), m.group(2)
+            if b[:1].islower() and self._vocabulario.get((a + b).lower(), 0) >= 1:
+                return a + b
+            return m.group(0)
+        return re.sub(r"([^\W\d_]+)-([^\W\d_]+)", trocar, texto)
 
     # ------------------------------------------------------------ ordem leitura
     def _duas_colunas(self, blocos_texto, largura_pagina) -> bool:
@@ -1105,6 +1327,18 @@ class MotorReflow:
         ya1 = ultima["bbox"][3]
         yb0 = primeira["bbox"][1]
         altura = max(1.0, ultima["bbox"][3] - ultima["bbox"][1])
+        # Frase claramente interrompida: A termina sem pontuacao, B comeca
+        # com minuscula, na mesma margem. Vale mesmo com um respiro de
+        # paragrafo entre os dois -- o Calibre parte paragrafos assim
+        # ("...dois cliques nele. O" | "navegador deve abrir...").
+        texto_a = _texto_da_linha(ultima).rstrip()
+        texto_b = _texto_da_linha(primeira).lstrip()
+        if (_frase_interrompida(texto_a, texto_b)
+                and abs(primeira["bbox"][0] - min(l["bbox"][0] for l in linhas_a)) <= 3
+                and -altura * 0.5 <= yb0 - ya1 <= altura * 2.6
+                and not _parece_linha_de_codigo(texto_a)
+                and not _parece_linha_de_codigo(texto_b)):
+            return True
         # Proxima linha logo abaixo (nem sobreposta, nem depois de um respiro
         # de paragrafo grande).
         if not (-altura * 0.5 <= yb0 - ya1 <= altura * 0.9):
@@ -1171,6 +1405,25 @@ class MotorReflow:
         if not linhas:
             return []
 
+        # Cabecalho/rodape que virou texto corrido (ver recorrentes_corpo).
+        # Bloco curto com uma dessas linhas e o cabecalho inteiro ("1.8.
+        # Socorro!... Casa do Codigo"): sai todo.
+        if self.recorrentes_corpo:
+            marcadas = [_normalizar_assinatura(_limpar(l["texto"])) in self.recorrentes_corpo
+                        for l in linhas]
+            # O cabecalho as vezes vem quebrado em outro ponto ("...amigos
+            # Casa do" / "Codigo"): procura a frase no bloco curto inteiro.
+            inteiro = _normalizar_assinatura(_limpar(" ".join(l["texto"] for l in linhas)))
+            if (len(linhas) <= 3 and len(inteiro) <= 160 and any(
+                    len(r.split()) >= 2 and r in inteiro for r in self.recorrentes_corpo)):
+                return []
+            if any(marcadas):
+                if len(linhas) <= 3:
+                    return []
+                linhas = [l for l, m in zip(linhas, marcadas) if not m]
+                if not linhas:
+                    return []
+
         # Bloco de codigo: quebras de linha e indentacao SAO o conteudo, entao
         # ele escapa do reflow. Sem isso, listagens de codigo e arvores de
         # diretorio viravam uma papa ilegivel de tokens.
@@ -1212,8 +1465,11 @@ class MotorReflow:
         for anterior, linha in zip(linhas, linhas[1:]):
             quebra = False
 
-            # 1. Salto vertical maior que o entrelinhas normal.
-            if linha["y0"] - anterior["y1"] > altura_media * 0.75:
+            # 1. Salto vertical maior que o entrelinhas normal -- salvo frase
+            #    claramente interrompida (sem pontuacao no fim, minuscula no
+            #    comeco): ali o salto e defeito do conversor, nao paragrafo.
+            if (linha["y0"] - anterior["y1"] > altura_media * 0.75
+                    and not _frase_interrompida(anterior["texto"], linha["texto"])):
                 quebra = True
             # A linha anterior chegou a margem direita sem fechar a frase: esta
             # e a continuacao dela, mesmo que o autor tenha posto a palavra em
@@ -1328,13 +1584,16 @@ class MotorReflow:
             return Bloco("titulo", texto, nivel=1)
         if tamanho >= corpo * 1.22:
             return Bloco("titulo", texto, nivel=2)
-        if negrito > 0.75 and len(texto) < 110 and tamanho >= corpo * 0.98:
+        if (negrito > 0.75 and len(texto) < 110 and tamanho >= corpo * 0.98
+                and not self.corpo_negrito):
             return Bloco("titulo", texto, nivel=3)
         letras = [c for c in texto if c.isalpha()]
         if letras and len(texto) < 80 and sum(c.isupper() for c in letras) / len(letras) > 0.85:
             return Bloco("titulo", texto, nivel=3)
 
-        if tamanho <= corpo * 0.82:
+        # Livro sem estrutura: o tamanho menor e so OUTRA parte do livro
+        # (pre-textuais, apendices), nao nota de rodape.
+        if tamanho <= corpo * 0.82 and not self.corpo_negrito:
             return Bloco("nota", texto)
 
         # Bloco inteiro recuado = citacao.

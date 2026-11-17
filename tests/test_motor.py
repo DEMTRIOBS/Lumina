@@ -270,6 +270,39 @@ class TestEpub(unittest.TestCase):
             self.assertTrue(any(b.tipo == "paragrafo" for b in blocos))
 
 
+class TestLivroSemEstrutura(unittest.TestCase):
+    """PDF gerado pelo Calibre: tudo numa fonte so, cabecalho no meio do texto."""
+
+    def test_linha_de_codigo_pelo_conteudo(self):
+        from services.reflow import _parece_linha_de_codigo
+        self.assertTrue(_parece_linha_de_codigo("var ano = 2012;"))
+        self.assertTrue(_parece_linha_de_codigo('document.write("oi");'))
+        self.assertTrue(_parece_linha_de_codigo('");'))
+        self.assertFalse(_parece_linha_de_codigo("importante experimentar alem das licoes."))
+        self.assertFalse(_parece_linha_de_codigo("Variavel e um nome para um valor."))
+
+    def test_frase_interrompida(self):
+        from services.reflow import _frase_interrompida
+        self.assertTrue(_frase_interrompida("e de dois cliques nele. O", "navegador deve abrir"))
+        self.assertTrue(_frase_interrompida("falando numa", '"lingua" que ele'))
+        self.assertFalse(_frase_interrompida("Fim do paragrafo.", "outro comeco"))
+
+    def test_corpo_negrito_e_cabecalho_corrido(self):
+        doc = fitz.open()
+        for n in range(12):
+            pg = doc.new_page()
+            y = 80
+            for _ in range(5):
+                y = _caixa(pg, y, FRASE * 2, "hebo", 14, h=120)
+            _caixa(pg, y, "%d" % (n + 10), "hebo", 14, h=20)
+            _caixa(pg, y + 24, "E-book gerado especialmente para Fulano de Tal", "hebo", 14, h=20)
+        motor = MotorReflow(doc)
+        self.assertTrue(motor.corpo_negrito)
+        blocos = motor.pagina(5).blocos
+        self.assertFalse(any(b.tipo == "titulo" for b in blocos), [b.texto[:40] for b in blocos])
+        self.assertFalse(any("E-book gerado" in b.texto for b in blocos))
+
+
 class TestDiversos(unittest.TestCase):
 
     def test_modo_livre_antigo_vira_rolagem_continua(self):
