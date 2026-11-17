@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.3.3 — 2026-11-17
+
+- EPUB convertido pelo Calibre a partir de PDF: cabecalho, numero de pagina e
+  marca d'agua (inclusive o e-mail sozinho, quando a marca se parte entre duas
+  paginas) agora saem tambem no EPUB.
+- Cabecalho de secao colado antes de um titulo ("4.2. Verifique... Casa do
+  Codigo 4.2 Verifique...") e removido.
+
 ## 2.3.2 — 2026-11-17
 
 ### Livros que perderam a estrutura na conversao

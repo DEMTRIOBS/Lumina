@@ -931,13 +931,15 @@ class MotorReflow:
             # varias (o mesmo diagrama retomado a cada secao de um capitulo).
             # Repetidas em metade das paginas, em qualquer lugar delas. So
             # frases (2+ palavras) -- "Exemplo:" pode se repetir de verdade --
-            # e numero solto apenas quando o livro perdeu a estrutura.
-            from services.pdf_service import veio_de_epub as _de_epub
-            if paginas_validas >= 8 and not _de_epub(self.doc):
+            # e numero solto apenas quando o livro perdeu a estrutura. Vale
+            # tambem para EPUB: o Calibre converte PDF em EPUB levando junto o
+            # cabecalho e a marca d'agua como paragrafos. Titulo de capitulo
+            # ("Capitulo #") nao chega a metade das paginas.
+            if paginas_validas >= 8:
                 minimo_corpo = max(4, int(paginas_validas * 0.5))
                 self.recorrentes_corpo = {
                     a for a, c in contagem_corpo.items()
-                    if c >= minimo_corpo and (len(a.split()) >= 2
+                    if c >= minimo_corpo and (len(a.split()) >= 2 or "@" in a
                                               or (self.corpo_negrito and not any(
                                                   ch.isalpha() for ch in a)))}
             minimo_img = max(3, int(paginas_validas * _LIMIAR_IMAGEM_RECORRENTE))
@@ -1200,7 +1202,7 @@ class MotorReflow:
             padroes = []
             for frase in self.recorrentes_corpo:
                 palavras = frase.split()
-                if len(palavras) < 2:
+                if len(palavras) < 2 and "@" not in frase:
                     continue
                 corpo = r"\s+".join(re.escape(p).replace("\\#", r"\d+")
                                     .replace("#", r"\d+") for p in palavras)
@@ -1231,12 +1233,12 @@ class MotorReflow:
             if seguinte:
                 texto = texto[:achado.start()] + texto[fim + seguinte.end():]
                 continue
-            # No meio da frase: sai a frase repetida e o titulo de secao
-            # ("1.7. Conheca e use o console do Chrome") colado antes dela.
-            def tirar(m):
-                return " "
-            secao = r"(?:\d+(?:\.\d+)+\.?\s+[^.!?]{3,90}?\s+)?"
-            texto = re.sub(secao + padrao.pattern + r"(?=\s+[a-zà-ÿ])", tirar, texto,
+            # Cabecalho de secao inteiro ("4.2. Verifique... Casa do Codigo"):
+            # sai sempre, seja o que vier depois.
+            texto = re.sub(r"\d+(?:\.\d+)+\.\s+[^.!?]{3,90}?\s+" + padrao.pattern,
+                           " ", texto, flags=re.IGNORECASE)
+            # No meio da frase: sai a frase repetida.
+            texto = re.sub(padrao.pattern + r"(?=\s+[a-zà-ÿ])", " ", texto,
                            flags=re.IGNORECASE)
         return re.sub(r"\s{2,}", " ", texto).strip()
 
