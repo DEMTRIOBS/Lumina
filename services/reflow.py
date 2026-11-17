@@ -540,6 +540,10 @@ def _frase_interrompida(texto_a, texto_b) -> bool:
         and not _parece_linha_de_codigo(a) and not _parece_linha_de_codigo(b)
 
 
+_RE_ROTULO_DE_SECAO = re.compile(
+    r"^(?:cap[ií]tulo|chapter|parte|part|livro|se[cç][aã]o|section|aula|li[cç][aã]o)\s+#",
+    re.IGNORECASE)
+
 _RE_NUM_SECAO = re.compile(r"^\d{1,2}(?:\.\d{1,3})+\.?$")
 _RE_CAPITULO = re.compile(r"^(?:cap[ií]tulo|chapter)\s+\d{1,3}$", re.IGNORECASE)
 
@@ -805,6 +809,7 @@ class MotorReflow:
         # rodape que viraram texto corrido (PDF do Calibre: "15", "Casa do
         # Codigo", marca d'agua com o nome de quem comprou o e-book).
         contagem_corpo = Counter()
+        ocorrencias_corpo = Counter()
         linhas_codigo = []
         contagem_imagem = Counter()
         paginas_validas = 0
@@ -862,7 +867,9 @@ class MotorReflow:
                     texto_bloco.append(texto_linha)
                     limpa = texto_linha.strip()
                     if limpa and len(limpa) <= 90:
-                        vistos_corpo.add(_normalizar_assinatura(_limpar(limpa)))
+                        assinatura_linha = _normalizar_assinatura(_limpar(limpa))
+                        vistos_corpo.add(assinatura_linha)
+                        ocorrencias_corpo[assinatura_linha] += 1
                     if len(linhas_codigo) < 600 and _parece_linha_de_codigo(limpa):
                         linhas_codigo.append(limpa)
                     if texto_linha.strip() and not na_margem and len(linhas_info) < 6000:
@@ -939,7 +946,13 @@ class MotorReflow:
                 minimo_corpo = max(4, int(paginas_validas * 0.5))
                 self.recorrentes_corpo = {
                     a for a, c in contagem_corpo.items()
-                    if c >= minimo_corpo and (len(a.split()) >= 2 or "@" in a
+                    # Titulo de capitulo/parte nunca e cabecalho, mesmo num
+                    # livro curto em que "Capitulo #" aparece em meia pagina.
+                    # Cabecalho aparece UMA vez por pagina; texto repetido de
+                    # proposito (refrao, exemplo) aparece varias -- e fica.
+                    if c >= minimo_corpo and not _RE_ROTULO_DE_SECAO.match(a)
+                    and ocorrencias_corpo[a] <= c * 1.5
+                    and (len(a.split()) >= 2 or "@" in a
                                               or (self.corpo_negrito and not any(
                                                   ch.isalpha() for ch in a)))}
             minimo_img = max(3, int(paginas_validas * _LIMIAR_IMAGEM_RECORRENTE))
